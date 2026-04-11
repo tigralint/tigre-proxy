@@ -31,6 +31,8 @@ fun SettingsScreen(
     onSave: (ProxyConfig) -> Unit,
     onRequestBatteryOptimization: () -> Unit,
     isBatteryOptimized: Boolean,
+    hasAutoStart: Boolean,
+    onRequestAutoStart: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var secret by remember(config) { mutableStateOf(config.secret) }
@@ -163,6 +165,35 @@ fun SettingsScreen(
                         TextButton(onClick = onRequestBatteryOptimization) {
                             Text(Texts.fix, color = AppleBlue, style = MaterialTheme.typography.bodyLarge)
                         }
+                    }
+                }
+                
+                if (hasAutoStart) {
+                    HorizontalDivider(color = DividerColor, modifier = Modifier.padding(start = 56.dp))
+                    
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onRequestAutoStart() }
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.AppRegistration,
+                            contentDescription = null,
+                            tint = AppleOrange,
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(Texts.autoStart, style = MaterialTheme.typography.bodyLarge, color = TextPrimary)
+                            Text(
+                                Texts.autoStartDesc,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Icon(Icons.Outlined.ArrowForwardIos, null, tint = TextSecondary, modifier = Modifier.size(16.dp))
                     }
                 }
                 

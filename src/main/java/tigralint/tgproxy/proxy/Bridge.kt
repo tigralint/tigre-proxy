@@ -2,11 +2,9 @@ package tigralint.tgproxy.proxy
 
 import android.util.Log
 import kotlinx.coroutines.*
-import java.io.BufferedOutputStream
-import java.io.InputStream
-import java.io.OutputStream
-import java.net.InetSocketAddress
-import java.net.Socket
+import io.ktor.utils.io.*
+import io.ktor.network.selector.*
+import io.ktor.network.sockets.*
 
 /**
  * Bidirectional TCP ↔ WS bridge with re-encryption.
@@ -26,8 +24,8 @@ object Bridge {
      * Bridge client TCP connection to a WebSocket connection with re-encryption.
      */
     suspend fun bridgeWsReencrypt(
-        clientInput: InputStream,
-        clientOutput: OutputStream,
+        clientInput: ByteReadChannel,
+        clientOutput: ByteWriteChannel,
         ws: ProxyWebSocket,
         label: String,
         dc: Int,
@@ -47,8 +45,9 @@ object Bridge {
             val tcpToWs = launch(Dispatchers.IO) {
                 try {
                     val buf = ByteArray(READ_BUF_SIZE)
-                    while (isActive) {
-                        val n = clientInput.read(buf)
+                    val outBuf = ByteArray(READ_BUF_SIZE)
+                    while (isActive && !clientInput.isClosedForRead) {
+                        val n = clientInput.readAvailable(buf)
                         if (n == -1) {
                             // Client disconnected — flush splitter
                             if (splitter != null) {
@@ -64,9 +63,12 @@ object Bridge {
                         upBytes += n
                         upPackets++
 
-                        // Re-encrypt: client cipher → plaintext → telegram cipher
-                        val plain = ctx.cltDec.update(buf, 0, n)
-                        val tgCipher = ctx.tgEnc.update(plain)
+                        // Re-encrypt: ZERO ALLOCATION (mostly). client cipher → plaintext → telegram cipher
+                        // We use a shared outBuf to avoid allocating `plain`.
+                        // The final target buffer must be precisely sized for the WebSocket to send.
+                        ctx.cltDec.update(buf, 0, n, outBuf, 0)
+                        val tgCipher = ByteArray(n)
+                        ctx.tgEnc.update(outBuf, 0, n, tgCipher, 0)
 
                         if (splitter != null) {
                             val parts = splitter.split(tgCipher)
@@ -80,7 +82,7 @@ object Bridge {
                             ws.send(tgCipher)
                         }
                     }
-                } catch (_: CancellationException) {
+                } catch (_: kotlinx.coroutines.CancellationException) {
                 } catch (e: Exception) {
                     Log.d(TAG, "[$label] tcp→ws ended: $e")
                 }
@@ -95,14 +97,16 @@ object Bridge {
                         downBytes += n
                         downPackets++
 
-                        // Re-encrypt: telegram cipher → plaintext → client cipher
-                        val plain = ctx.tgDec.update(data)
-                        val clientCipher = ctx.cltEnc.update(plain)
+                        // Re-encrypt IN-PLACE! (ZERO ALLOCATION)
+                        // telegram cipher → plaintext → client cipher
+                        // Since `data` array is fully owned by us after recv(), we mutate it in-place.
+                        ctx.tgDec.update(data, 0, n, data, 0)
+                        ctx.cltEnc.update(data, 0, n, data, 0)
 
-                        clientOutput.write(clientCipher)
+                        clientOutput.writeFully(data)
                         clientOutput.flush()
                     }
-                } catch (_: CancellationException) {
+                } catch (_: kotlinx.coroutines.CancellationException) {
                 } catch (e: Exception) {
                     Log.d(TAG, "[$label] ws→tcp ended: $e")
                 }
@@ -126,8 +130,8 @@ object Bridge {
      * TCP direct fallback to Telegram DC.
      */
     suspend fun tcpFallback(
-        clientInput: InputStream,
-        clientOutput: OutputStream,
+        clientInput: ByteReadChannel,
+        clientOutput: ByteWriteChannel,
         dstIp: String,
         dstPort: Int,
         relayInit: ByteArray,
@@ -138,12 +142,12 @@ object Bridge {
         stats: ProxyStats
     ): Boolean {
         val socket = try {
-            withTimeout(10000) {
-                withContext(Dispatchers.IO) {
-                    Socket().apply {
-                        tcpNoDelay = true
-                        connect(InetSocketAddress(dstIp, dstPort), 10000)
-                    }
+            withTimeout(15000) {
+                val selectorManager = ActorSelectorManager(Dispatchers.IO)
+                aSocket(selectorManager).tcp().connect(io.ktor.network.sockets.InetSocketAddress(dstIp, dstPort)) {
+                    socketTimeout = 15000
+                    receiveBufferSize = 131072
+                    sendBufferSize = 131072
                 }
             }
         } catch (e: Exception) {
@@ -154,8 +158,8 @@ object Bridge {
         stats.connectionsTcpFallback.incrementAndGet()
 
         try {
-            val remoteInput = socket.getInputStream()
-            val remoteOutput = socket.getOutputStream()
+            val remoteInput = socket.openReadChannel()
+            val remoteOutput = socket.openWriteChannel(autoFlush = true)
 
             // Send relay init with TCP Fragmentation (DPI Bypass)
             // Break the handshake packet into tiny fragments to evade DPI signature matching (GoodbyeDPI style)
@@ -164,17 +168,14 @@ object Bridge {
                     val chunks = listOf(8, 8, 8)
                     var offset = 0
                     for (chunkSize in chunks) {
-                        remoteOutput.write(relayInit, offset, chunkSize)
-                        remoteOutput.flush()
+                        remoteOutput.writeFully(relayInit, offset, chunkSize)
                         offset += chunkSize
-                        Thread.sleep(5) // Guarantees exactly 5ms blocking on IO thread, evading slow coroutine scheduler wakeups
+                        delay(5) // Non-blocking delay for fragmentation
                     }
                     // Send the remainings
-                    remoteOutput.write(relayInit, offset, relayInit.size - offset)
-                    remoteOutput.flush()
+                    remoteOutput.writeFully(relayInit, offset, relayInit.size - offset)
                 } else {
-                    remoteOutput.write(relayInit)
-                    remoteOutput.flush()
+                    remoteOutput.writeFully(relayInit)
                 }
             }
 
@@ -183,16 +184,18 @@ object Bridge {
                 val up = launch(Dispatchers.IO) {
                     try {
                         val buf = ByteArray(READ_BUF_SIZE)
-                        while (isActive) {
-                            val n = clientInput.read(buf)
+                        val outBuf = ByteArray(READ_BUF_SIZE)
+                        while (isActive && !clientInput.isClosedForRead) {
+                            val n = clientInput.readAvailable(buf)
                             if (n == -1) break
                             stats.bytesUp.addAndGet(n.toLong())
-                            val plain = ctx.cltDec.update(buf, 0, n)
-                            val tgData = ctx.tgEnc.update(plain)
-                            remoteOutput.write(tgData)
-                            remoteOutput.flush()
+                            
+                            // ZERO-ALLOCATION chain: buf -> outBuf -> buf
+                            ctx.cltDec.update(buf, 0, n, outBuf, 0)
+                            ctx.tgEnc.update(outBuf, 0, n, buf, 0)
+                            remoteOutput.writeFully(buf, 0, n)
                         }
-                    } catch (_: CancellationException) {
+                    } catch (_: kotlinx.coroutines.CancellationException) {
                     } catch (e: Exception) {
                         Log.d(TAG, "[$label] tcp→tcp up ended: $e")
                     }
@@ -201,16 +204,19 @@ object Bridge {
                 val down = launch(Dispatchers.IO) {
                     try {
                         val buf = ByteArray(READ_BUF_SIZE)
-                        while (isActive) {
-                            val n = remoteInput.read(buf)
+                        val outBuf = ByteArray(READ_BUF_SIZE)
+                        while (isActive && !remoteInput.isClosedForRead) {
+                            val n = remoteInput.readAvailable(buf)
                             if (n == -1) break
                             stats.bytesDown.addAndGet(n.toLong())
-                            val plain = ctx.tgDec.update(buf, 0, n)
-                            val clientData = ctx.cltEnc.update(plain)
-                            clientOutput.write(clientData)
+                            
+                            // ZERO-ALLOCATION chain: buf -> outBuf -> buf
+                            ctx.tgDec.update(buf, 0, n, outBuf, 0)
+                            ctx.cltEnc.update(outBuf, 0, n, buf, 0)
+                            clientOutput.writeFully(buf, 0, n)
                             clientOutput.flush()
                         }
-                    } catch (_: CancellationException) {
+                    } catch (_: kotlinx.coroutines.CancellationException) {
                     } catch (e: Exception) {
                         Log.d(TAG, "[$label] tcp→tcp down ended: $e")
                     }
@@ -219,7 +225,7 @@ object Bridge {
                 select(up, down)
             }
         } finally {
-            try { socket.close() } catch (_: Exception) {}
+            try { socket.dispose() } catch (_: Exception) {}
         }
 
         stats.publishSnapshot()
@@ -230,8 +236,8 @@ object Bridge {
      * Cloudflare proxy fallback.
      */
     suspend fun cfProxyFallback(
-        clientInput: InputStream,
-        clientOutput: OutputStream,
+        clientInput: ByteReadChannel,
+        clientOutput: ByteWriteChannel,
         relayInit: ByteArray,
         label: String,
         dc: Int,
@@ -279,8 +285,8 @@ object Bridge {
      * Try all available fallback methods for a DC.
      */
     suspend fun doFallback(
-        clientInput: InputStream,
-        clientOutput: OutputStream,
+        clientInput: ByteReadChannel,
+        clientOutput: ByteWriteChannel,
         relayInit: ByteArray,
         label: String,
         dc: Int,

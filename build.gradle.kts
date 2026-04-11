@@ -82,6 +82,9 @@ dependencies {
     // OkHttp for WebSocket client
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Ktor Network for async NIO TCP sockets
+    implementation("io.ktor:ktor-network:3.0.0")
+
     // Google Fonts for Compose
     implementation("androidx.compose.ui:ui-text-google-fonts")
 

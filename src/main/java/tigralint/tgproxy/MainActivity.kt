@@ -39,10 +39,12 @@ import tigralint.tgproxy.proxy.TcpServer
 import tigralint.tgproxy.service.ProxyForegroundService
 import tigralint.tgproxy.ui.screens.DashboardScreen
 import tigralint.tgproxy.ui.screens.FaqScreen
+import tigralint.tgproxy.ui.screens.LogsScreen
 import tigralint.tgproxy.ui.screens.SettingsScreen
 import tigralint.tgproxy.util.Texts
 import tigralint.tgproxy.ui.theme.*
 import tigralint.tgproxy.util.BatteryOptimization
+import tigralint.tgproxy.util.ConfigStorage
 
 class MainActivity : ComponentActivity() {
 
@@ -55,9 +57,10 @@ class MainActivity : ComponentActivity() {
     // State holders
     private val proxyStatus = mutableStateOf(ProxyForegroundService.ProxyStatus.STOPPED)
     private val proxyStats = mutableStateOf(ProxyStats.Snapshot())
-    private val proxyConfig = mutableStateOf(ProxyConfig())
+    private val proxyConfig = mutableStateOf(ProxyConfig()) // Will be loaded in onCreate
     private val proxyLink = mutableStateOf("")
     private val isBatteryOptimized = mutableStateOf(true)
+    private val hasAutoStart = mutableStateOf(false)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -85,6 +88,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences("TgProxyPrefs", Context.MODE_PRIVATE)
         Texts.isRu = prefs.getBoolean("isRu", true)
+        
+        // Load persistent proxy config
+        proxyConfig.value = ConfigStorage.load(this)
+        
         enableEdgeToEdge()
 
         // Request notification permission on Android 13+
@@ -106,6 +113,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         isBatteryOptimized.value = BatteryOptimization.isBatteryOptimized(this)
+        hasAutoStart.value = BatteryOptimization.hasAutoStartSettings(this)
         bindProxyService()
     }
 
@@ -169,6 +177,7 @@ class MainActivity : ComponentActivity() {
 
                     listOf(
                         NavItem("dashboard", Texts.dashboard, Icons.Filled.Dashboard, Icons.Outlined.Dashboard),
+                        NavItem("logs", Texts.logsTitle, Icons.Filled.List, Icons.Outlined.List),
                         NavItem("settings", Texts.settings, Icons.Filled.Settings, Icons.Outlined.Settings),
                         NavItem("faq", Texts.faq, Icons.Filled.Help, Icons.Outlined.HelpOutline)
                     ).forEach { item ->
@@ -226,13 +235,21 @@ class MainActivity : ComponentActivity() {
                         isRunning = status == ProxyForegroundService.ProxyStatus.RUNNING,
                         onSave = { newConfig ->
                             proxyConfig.value = newConfig
+                            ConfigStorage.save(this@MainActivity, newConfig)
                             proxyService?.updateConfig(newConfig)
                         },
                         onRequestBatteryOptimization = {
                             BatteryOptimization.requestDisableBatteryOptimization(this@MainActivity)
                         },
-                        isBatteryOptimized = isBatteryOptimized.value
+                        isBatteryOptimized = isBatteryOptimized.value,
+                        hasAutoStart = hasAutoStart.value,
+                        onRequestAutoStart = {
+                            BatteryOptimization.requestAutoStart(this@MainActivity)
+                        }
                     )
+                }
+                composable("logs") {
+                    LogsScreen()
                 }
                 composable("faq") {
                     FaqScreen()

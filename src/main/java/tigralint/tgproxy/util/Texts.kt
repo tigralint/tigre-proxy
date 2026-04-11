@@ -51,6 +51,8 @@ object Texts {
     val batteryNotDisabled get() = if (isRu) "Внимание: система может закрывать прокси" else "Warning: system might kill the proxy"
     val batteryDisabled get() = if (isRu) "Прокси работает стабильно в фоне" else "Proxy runs reliably in the background"
     val fix get() = if (isRu) "Исправить" else "Fix"
+    val autoStart get() = if (isRu) "Автозапуск (Huawei/Xiaomi/Oppo)" else "AutoStart (Huawei/Xiaomi/Oppo)"
+    val autoStartDesc get() = if (isRu) "Нажмите, если приложение вылетает в фоне" else "Tap if app is killed in background"
     val saveSettings get() = if (isRu) "Сохранить настройки" else "Save Settings"
     
     // Language
@@ -59,6 +61,10 @@ object Texts {
     val english get() = "English"
 
     val noTelegram get() = if (isRu) "Telegram не установлен" else "Telegram not installed"
+
+    // Logs
+    val logsTitle get() = if (isRu) "Логи" else "Logs"
+    val logsClear get() = if (isRu) "Очистить" else "Clear"
 
     // FAQ
     val faq get() = "FAQ"

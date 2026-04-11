@@ -18,6 +18,7 @@ import tigralint.tgproxy.TgProxyApp
 import tigralint.tgproxy.proxy.ProxyConfig
 import tigralint.tgproxy.proxy.ProxyStats
 import tigralint.tgproxy.proxy.TcpServer
+import tigralint.tgproxy.util.ConfigStorage
 
 /**
  * Foreground service that runs the MTProto proxy.
@@ -29,6 +30,18 @@ class ProxyForegroundService : Service() {
         const val ACTION_START = "tigralint.tgproxy.START"
         const val ACTION_STOP = "tigralint.tgproxy.STOP"
         private const val NOTIFICATION_ID = 1
+
+        var isRunning = false
+            private set
+
+        fun requestTileUpdate(context: android.content.Context) {
+            try {
+                android.service.quicksettings.TileService.requestListeningState(
+                    context,
+                    android.content.ComponentName(context, ProxyTileService::class.java)
+                )
+            } catch (_: Exception) {}
+        }
     }
 
     enum class ProxyStatus {
@@ -60,6 +73,7 @@ class ProxyForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        config = ConfigStorage.load(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -87,6 +101,8 @@ class ProxyForegroundService : Service() {
         serverJob = serviceScope?.launch {
             try {
                 _status.value = ProxyStatus.RUNNING
+                isRunning = true
+                requestTileUpdate(this@ProxyForegroundService)
                 updateNotification("Listening on ${config.host}:${config.port}")
                 server.start()
             } catch (e: CancellationException) {
@@ -107,6 +123,8 @@ class ProxyForegroundService : Service() {
         tcpServer?.stop()
         tcpServer = null
         _status.value = ProxyStatus.STOPPED
+        isRunning = false
+        requestTileUpdate(this)
         releaseWakeLock()
         updateNotification("Proxy stopped")
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -132,12 +150,24 @@ class ProxyForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val tgIntent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("tg://")).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val tgPendingIntent = PendingIntent.getActivity(
+            this, 2, tgIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val btnStop = tigralint.tgproxy.util.Texts.stopProxy
+        val btnTg = tigralint.tgproxy.util.Texts.openInTelegram
+
         return NotificationCompat.Builder(this, TgProxyApp.NOTIFICATION_CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
-            .addAction(android.R.drawable.ic_media_pause, "Stop", stopIntent)
+            .addAction(android.R.drawable.ic_media_pause, btnStop, stopIntent)
+            .addAction(android.R.drawable.ic_menu_send, btnTg, tgPendingIntent)
             .setOngoing(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()

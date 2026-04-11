@@ -23,10 +23,18 @@ class AesCtrCipher(key: ByteArray, iv: ByteArray) {
     }
 
     /**
-     * Process a slice of the buffer without copying. Zero-alloc hot path.
+     * Process a slice of the buffer without copying. Returns a newly allocated array.
      */
     fun update(data: ByteArray, offset: Int, len: Int): ByteArray {
         return cipher.update(data, offset, len)
+    }
+
+    /**
+     * ULTRA ZERO-ALLOCATION PATH.
+     * Process data directly into the provided output buffer. 
+     */
+    fun update(input: ByteArray, inOff: Int, len: Int, output: ByteArray, outOff: Int): Int {
+        return cipher.update(input, inOff, len, output, outOff)
     }
 
     /** Advance the cipher keystream by [n] zero bytes (fast-forward). */

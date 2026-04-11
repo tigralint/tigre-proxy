@@ -7,6 +7,9 @@ import java.nio.ByteOrder
 import java.security.SecureRandom
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+import io.ktor.utils.io.*
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.GlobalScope
 
 /**
  * FakeTLS masking for DPI evasion.
@@ -167,5 +170,71 @@ object FakeTls {
             offset += chunkLen
         }
         return parts.fold(ByteArray(0)) { acc, arr -> acc + arr }
+    }
+
+    /**
+     * Creates an async Ktor pipe that unwraps TLS Application Data records
+     * from the raw [source] and pushes the plaintext MTProto data to the returned channel.
+     */
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+    fun unwrapFakeTls(source: ByteReadChannel): ByteReadChannel {
+        return kotlinx.coroutines.GlobalScope.writer(kotlinx.coroutines.Dispatchers.IO, autoFlush = true) {
+            val dest = channel
+            try {
+                while (!source.isClosedForRead) {
+                    val hdr = ByteArray(5)
+                    try {
+                        source.readFully(hdr)
+                    } catch (e: Exception) {
+                        break // EOF or closed
+                    }
+                    val rtype = hdr[0]
+                    val recLen = ByteBuffer.wrap(hdr, 3, 2).short.toInt() and 0xFFFF
+
+                    if (rtype == TLS_RECORD_CCS) {
+                        source.discardExact(recLen.toLong())
+                        continue
+                    }
+
+                    if (rtype != TLS_RECORD_APPDATA) {
+                        break
+                    }
+
+                    // Copy EXACTLY recLen bytes from source to dest
+                    var left = recLen.toLong()
+                    val copyBuf = ByteArray(8192)
+                    while (left > 0 && !source.isClosedForRead) {
+                        val toRead = minOf(left.toInt(), copyBuf.size)
+                        val n = source.readAvailable(copyBuf, 0, toRead)
+                        if (n == -1) break
+                        dest.writeFully(copyBuf, 0, n)
+                        left -= n
+                    }
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+            } catch (_: Exception) {}
+        }.channel
+    }
+
+    /**
+     * Creates an async Ktor pipe that wraps any raw MTProto data written to the
+     * returned channel into FakeTLS Application Data records and writes them to [destination].
+     */
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+    fun wrapFakeTls(destination: ByteWriteChannel): ByteWriteChannel {
+        return kotlinx.coroutines.GlobalScope.reader(kotlinx.coroutines.Dispatchers.IO) {
+            val source = channel
+            try {
+                val buf = ByteArray(16384)
+                while (!source.isClosedForRead) {
+                    val n = source.readAvailable(buf)
+                    if (n == -1) break
+                    val tlsRec = wrapTlsRecord(buf.copyOfRange(0, n))
+                    destination.writeFully(tlsRec)
+                    destination.flush()
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+            } catch (_: Exception) {}
+        }.channel
     }
 }

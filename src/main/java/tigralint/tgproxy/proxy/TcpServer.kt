@@ -1,13 +1,10 @@
 package tigralint.tgproxy.proxy
 
-import android.util.Log
+import tigralint.tgproxy.util.AppLogger
 import kotlinx.coroutines.*
-import java.io.InputStream
-import java.io.OutputStream
-import java.net.InetSocketAddress
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.SocketTimeoutException
+import io.ktor.utils.io.*
+import io.ktor.network.selector.*
+import io.ktor.network.sockets.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
@@ -42,7 +39,13 @@ class TcpServer(
         private set
 
     private fun log(level: String, message: String) {
-        Log.d(TAG, "[$level] $message")
+        when (level) {
+            "DEBUG" -> AppLogger.d(TAG, message)
+            "INFO" -> AppLogger.i(TAG, message)
+            "WARN" -> AppLogger.w(TAG, message)
+            "ERROR" -> AppLogger.e(TAG, message)
+            else -> AppLogger.d(TAG, message)
+        }
     }
 
     /**
@@ -85,9 +88,8 @@ class TcpServer(
         val pool = WsPool(config, stats, serverScope)
         wsPool = pool
 
-        val server = ServerSocket()
-        server.reuseAddress = true
-        server.bind(InetSocketAddress(config.host, config.port))
+        val selectorManager = ActorSelectorManager(Dispatchers.IO)
+        val server = aSocket(selectorManager).tcp().bind(io.ktor.network.sockets.InetSocketAddress(config.host, config.port))
         serverSocket = server
         isRunning = true
 
@@ -127,20 +129,20 @@ class TcpServer(
         try {
             while (isActive && !server.isClosed) {
                 try {
-                    server.soTimeout = 1000 // Check for cancellation every second
-                    val client = try {
-                        server.accept()
-                    } catch (_: SocketTimeoutException) {
-                        continue
-                    }
-
-                    client.tcpNoDelay = true
-                    client.setSoTimeout(10000)
-
+                    val client = server.accept()
+                    
                     serverScope.launch(Dispatchers.IO) {
-                        handleClient(client, secret, pool)
+                        try {
+                            handleClient(client, secret, pool)
+                        } catch (e: Exception) {
+                            if (e !is kotlinx.coroutines.CancellationException) {
+                                log("DEBUG", "Client error: $e")
+                            }
+                        } finally {
+                            try { client.dispose() } catch (_: Exception) {}
+                        }
                     }
-                } catch (_: CancellationException) {
+                } catch (_: kotlinx.coroutines.CancellationException) {
                     break
                 } catch (e: Exception) {
                     if (isRunning) {
@@ -151,7 +153,7 @@ class TcpServer(
         } finally {
             isRunning = false
             pool.reset()
-            try { server.close() } catch (_: Exception) {}
+            try { server.dispose() } catch (_: Exception) {}
         }
     }
 
@@ -161,7 +163,7 @@ class TcpServer(
     fun stop() {
         isRunning = false
         scope?.cancel()
-        try { serverSocket?.close() } catch (_: Exception) {}
+        try { serverSocket?.dispose() } catch (_: Exception) {}
         wsPool?.reset()
         serverSocket = null
         wsPool = null
@@ -177,12 +179,12 @@ class TcpServer(
         stats.connectionsTotal.incrementAndGet()
         stats.connectionsActive.incrementAndGet()
 
-        val peer = "${client.inetAddress.hostAddress}:${client.port}"
+        val peer = client.remoteAddress.toString()
         var label = peer
 
         try {
-            val input = client.getInputStream()
-            val output = client.getOutputStream()
+            val input = client.openReadChannel()
+            val output = client.openWriteChannel(autoFlush = true)
 
             val masking = config.fakeTlsDomain
 
@@ -192,8 +194,8 @@ class TcpServer(
                 return
             }
 
-            var clientInput: InputStream = input
-            var clientOutput: OutputStream = output
+            var clientInput: ByteReadChannel = input
+            var clientOutput: ByteWriteChannel = output
             var handshake: ByteArray
 
             if (firstByte[0] == FakeTls.TLS_RECORD_HANDSHAKE && masking.isNotEmpty()) {
@@ -223,25 +225,22 @@ class TcpServer(
 
                 log("DEBUG", "[$label] Fake TLS handshake ok (ts=${tlsResult.timestamp})")
 
-                // Build and send ServerHello
                 val serverHello = FakeTls.buildServerHello(secret, tlsResult.clientRandom, tlsResult.sessionId)
-                withContext(Dispatchers.IO) {
-                    output.write(serverHello)
-                    output.flush()
-                }
+                output.writeFully(serverHello)
+                output.flush()
 
-                // Wrap in FakeTlsStream
-                val tlsStream = FakeTlsStream(input, output)
+                // Wrap FakeTls channels
+                clientInput = FakeTls.run { unwrapFakeTls(input) }
+                clientOutput = FakeTls.run { wrapFakeTls(output) }
+
                 handshake = try {
-                    tlsStream.readExactly(Constants.HANDSHAKE_LEN)
+                    val buf = ByteArray(Constants.HANDSHAKE_LEN)
+                    clientInput.readFully(buf)
+                    buf
                 } catch (e: Exception) {
                     log("DEBUG", "[$label] incomplete obfs2 init inside TLS")
                     return
                 }
-
-                // Use TLS stream for further communication
-                clientInput = TlsInputStream(tlsStream)
-                clientOutput = TlsOutputStream(tlsStream)
 
             } else if (masking.isNotEmpty()) {
                 log("DEBUG", "[$label] non-TLS byte 0x%02X → HTTP redirect".format(firstByte[0].toInt() and 0xFF))
@@ -249,10 +248,8 @@ class TcpServer(
                         "Location: https://$masking/\r\n" +
                         "Content-Length: 0\r\n" +
                         "Connection: close\r\n\r\n").toByteArray()
-                withContext(Dispatchers.IO) {
-                    output.write(redirect)
-                    output.flush()
-                }
+                output.writeFully(redirect)
+                output.flush()
                 return
             } else {
                 // No FakeTLS — read remaining 63 bytes for handshake
@@ -270,8 +267,7 @@ class TcpServer(
                 log("DEBUG", "[$label] bad handshake (wrong secret or proto)")
                 // Drain to prevent connection reset
                 try {
-                    val buf = ByteArray(4096)
-                    while (clientInput.read(buf) > 0) {}
+                    clientInput.discard()
                 } catch (_: Exception) {}
                 return
             }
@@ -397,7 +393,7 @@ class TcpServer(
                 dc, isMedia, ctx, splitter, stats
             )
 
-        } catch (_: CancellationException) {
+        } catch (_: kotlinx.coroutines.CancellationException) {
             log("DEBUG", "[$label] cancelled")
         } catch (e: Exception) {
             log("ERROR", "[$label] unexpected: $e")
@@ -471,18 +467,17 @@ class TcpServer(
      * Port of proxy_to_masking_domain from fake_tls.py.
      */
     private suspend fun proxyToMaskingDomain(
-        clientInput: InputStream,
-        clientOutput: OutputStream,
+        clientInput: ByteReadChannel,
+        clientOutput: ByteWriteChannel,
         initialData: ByteArray,
         domain: String,
         label: String
     ) {
         val upstream = try {
-            withTimeout(10000) {
-                withContext(Dispatchers.IO) {
-                    Socket().apply {
-                        connect(InetSocketAddress(domain, 443), 10000)
-                    }
+            withTimeout(15000) {
+                val selectorManager = ActorSelectorManager(Dispatchers.IO)
+                aSocket(selectorManager).tcp().connect(io.ktor.network.sockets.InetSocketAddress(domain, 443)) {
+                    socketTimeout = 15000
                 }
             }
         } catch (e: Exception) {
@@ -494,13 +489,13 @@ class TcpServer(
         stats.connectionsMasked.incrementAndGet()
 
         try {
-            val upInput = upstream.getInputStream()
-            val upOutput = upstream.getOutputStream()
+            val upInput = upstream.openReadChannel()
+            val upOutput = upstream.openWriteChannel(autoFlush = true)
 
             // Send initial data
             if (initialData.isNotEmpty()) {
                 withContext(Dispatchers.IO) {
-                    upOutput.write(initialData)
+                    upOutput.writeFully(initialData)
                     upOutput.flush()
                 }
             }
@@ -509,10 +504,10 @@ class TcpServer(
                 launch(Dispatchers.IO) {
                     try {
                         val buf = ByteArray(16384)
-                        while (isActive) {
-                            val n = clientInput.read(buf)
+                        while (isActive && !clientInput.isClosedForRead) {
+                            val n = clientInput.readAvailable(buf)
                             if (n == -1) break
-                            upOutput.write(buf, 0, n)
+                            upOutput.writeFully(buf, 0, n)
                             upOutput.flush()
                         }
                     } catch (_: Exception) {}
@@ -520,10 +515,10 @@ class TcpServer(
                 launch(Dispatchers.IO) {
                     try {
                         val buf = ByteArray(16384)
-                        while (isActive) {
-                            val n = upInput.read(buf)
+                        while (isActive && !upInput.isClosedForRead) {
+                            val n = upInput.readAvailable(buf)
                             if (n == -1) break
-                            clientOutput.write(buf, 0, n)
+                            clientOutput.writeFully(buf, 0, n)
                             clientOutput.flush()
                         }
                     } catch (_: Exception) {}
@@ -531,24 +526,19 @@ class TcpServer(
             }
         } catch (_: Exception) {
         } finally {
-            try { upstream.close() } catch (_: Exception) {}
+            try { upstream.dispose() } catch (_: Exception) {}
         }
     }
 
-    private suspend fun readBytesWithTimeout(input: InputStream, n: Int): ByteArray? {
-        return withContext(Dispatchers.IO) {
-            try {
-                val buf = ByteArray(n)
-                var offset = 0
-                while (offset < n) {
-                    val read = input.read(buf, offset, n - offset)
-                    if (read == -1) return@withContext if (offset == 0) null else buf.copyOfRange(0, offset)
-                    offset += read
-                }
+    private suspend fun readBytesWithTimeout(input: ByteReadChannel, len: Int): ByteArray? {
+        return try {
+            withTimeout(2000) {
+                val buf = ByteArray(len)
+                input.readFully(buf, 0, len)
                 buf
-            } catch (_: Exception) {
-                null
             }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -560,36 +550,4 @@ class TcpServer(
     }
 }
 
-/**
- * InputStream adapter for FakeTlsStream.
- */
-private class TlsInputStream(private val tls: FakeTlsStream) : InputStream() {
-    override fun read(): Int {
-        val buf = tls.read(1)
-        return if (buf.isEmpty()) -1 else buf[0].toInt() and 0xFF
-    }
 
-    override fun read(b: ByteArray, off: Int, len: Int): Int {
-        val data = tls.read(len)
-        if (data.isEmpty()) return -1
-        System.arraycopy(data, 0, b, off, data.size)
-        return data.size
-    }
-}
-
-/**
- * OutputStream adapter for FakeTlsStream.
- */
-private class TlsOutputStream(private val tls: FakeTlsStream) : OutputStream() {
-    override fun write(b: Int) {
-        tls.write(byteArrayOf(b.toByte()))
-    }
-
-    override fun write(b: ByteArray, off: Int, len: Int) {
-        tls.write(b.copyOfRange(off, off + len))
-    }
-
-    override fun flush() {
-        tls.flush()
-    }
-}
