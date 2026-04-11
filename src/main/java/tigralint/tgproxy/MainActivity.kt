@@ -213,7 +213,11 @@ class MainActivity : ComponentActivity() {
                         status = status,
                         stats = statsSnapshot,
                         proxyLink = link,
-                        onToggleProxy = ::toggleProxy
+                        onToggleProxy = ::toggleProxy,
+                        isBatteryOptimized = isBatteryOptimized.value,
+                        onRequestBatteryOptimization = {
+                            BatteryOptimization.requestDisableBatteryOptimization(this@MainActivity)
+                        }
                     )
                 }
                 composable("settings") {

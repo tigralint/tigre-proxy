@@ -38,6 +38,8 @@ fun DashboardScreen(
     stats: ProxyStats.Snapshot,
     proxyLink: String,
     onToggleProxy: () -> Unit,
+    isBatteryOptimized: Boolean,
+    onRequestBatteryOptimization: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
@@ -57,8 +59,38 @@ fun DashboardScreen(
             style = MaterialTheme.typography.displayLarge.copy(fontWeight = FontWeight.Bold),
             color = TextPrimary
         )
-        
-        Spacer(modifier = Modifier.height(32.dp))
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        if (isBatteryOptimized) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = AppleSurface),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
+                onClick = onRequestBatteryOptimization
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Filled.Warning, null, tint = AppleOrange, modifier = Modifier.size(24.dp))
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            "Внимание! Ограничения фона",
+                            style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Bold),
+                            color = AppleOrange
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "Нажмите здесь, чтобы отключить выгрузку прокси из памяти",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextSecondary
+                        )
+                    }
+                }
+            }
+        }
 
         // Central Status Indicator (Apple Style)
         Card(

@@ -39,6 +39,7 @@ class ProxyForegroundService : Service() {
     private var serviceScope: CoroutineScope? = null
     private var serverJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
     private var tcpServer: TcpServer? = null
     var config: ProxyConfig = ProxyConfig()
@@ -158,6 +159,15 @@ class ProxyForegroundService : Service() {
         ).apply {
             acquire(10 * 60 * 60 * 1000L) // 10 hours max
         }
+        
+        val wm = getSystemService(android.net.wifi.WifiManager::class.java)
+        wifiLock = wm?.createWifiLock(
+            android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+            "TgProxy::ProxyWifiLock"
+        )?.apply {
+            setReferenceCounted(false)
+            acquire()
+        }
     }
 
     private fun releaseWakeLock() {
@@ -167,6 +177,13 @@ class ProxyForegroundService : Service() {
             }
         } catch (_: Exception) {}
         wakeLock = null
+        
+        try {
+            wifiLock?.let {
+                if (it.isHeld) it.release()
+            }
+        } catch (_: Exception) {}
+        wifiLock = null
     }
 
     /**

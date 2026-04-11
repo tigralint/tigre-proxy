@@ -9,3 +9,10 @@
 .cxx
 local.properties
 /app/build
+
+# Release builds and keys
+/release/
+*.apk
+*.aab
+*.jks
+*.keystore
