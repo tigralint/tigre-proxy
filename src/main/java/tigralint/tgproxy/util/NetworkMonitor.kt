@@ -58,6 +58,7 @@ class NetworkMonitor(context: Context) {
     }
 
     fun start() {
+        stop() // Prevent multiple registrations
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()

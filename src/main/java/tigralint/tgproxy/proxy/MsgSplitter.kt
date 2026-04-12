@@ -4,8 +4,9 @@ package tigralint.tgproxy.proxy
  * Splits a TCP byte stream into individual MTProto transport packets.
  * This ensures each WS frame contains exactly one transport packet.
  *
- * ZERO-ALLOCATION VERSION: Uses a flat ByteArray buffer with head/tail pointers
- * to completely eliminate garbage collection pressure during packet splitting.
+ * It uses flat pre-allocated internal buffers to reduce garbage collection 
+ * pressure during packet analysis, though it still returns allocated 
+ * ByteArrays to simplify the bridge logic.
  *
  * Port of MsgSplitter from bridge.py.
  */

@@ -82,10 +82,9 @@ class ProxyWebSocket private constructor(
          * - Trust-all certs → needed for connecting to Telegram IPs with different SNI
          */
         private val antiDpiClient: OkHttpClient by lazy {
-            val (sslFactory, trustManager) = AntiDpi.createConscryptSslContext()
+            val (sslFactory, trustManager) = AntiDpi.createSystemConscryptSslContext()
             OkHttpClient.Builder()
                 .sslSocketFactory(sslFactory, trustManager)
-                .hostnameVerifier { _, _ -> true }
                 .dns(AntiDpi.DohDns()) // DNS-over-HTTPS for ECH support
                 .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
                 .connectTimeout(10, TimeUnit.SECONDS)
@@ -95,10 +94,11 @@ class ProxyWebSocket private constructor(
         }
 
         /**
-         * Legacy OkHttp client without anti-DPI (fallback).
+         * Legacy OkHttp client without anti-DPI (fallback for direct IPs).
+         * Uses Trust-All because SNI won't match the IP's certificate.
          */
         private val legacyClient: OkHttpClient by lazy {
-            val (sslFactory, trustManager) = AntiDpi.createConscryptSslContext()
+            val (sslFactory, trustManager) = AntiDpi.createTrustAllConscryptSslContext()
             OkHttpClient.Builder()
                 .sslSocketFactory(sslFactory, trustManager)
                 .hostnameVerifier { _, _ -> true }
@@ -154,7 +154,7 @@ class ProxyWebSocket private constructor(
                 }
 
                 val request = requestBuilder.build()
-                val recvChannel = Channel<ByteArray>(Channel.UNLIMITED)
+                val recvChannel = Channel<ByteArray>(1024)
                 var connected = false
 
                 val ws = client.newWebSocket(request, object : WebSocketListener() {
@@ -165,7 +165,11 @@ class ProxyWebSocket private constructor(
                     }
 
                     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                        recvChannel.trySend(bytes.toByteArray())
+                        val success = recvChannel.trySend(bytes.toByteArray()).isSuccess
+                        if (!success) {
+                            // Buffer overflow: client is too slow, break to prevent OOM
+                            webSocket.close(1008, "Buffer overflow")
+                        }
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {

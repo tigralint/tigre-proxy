@@ -16,10 +16,9 @@ object CfProxyManager {
         "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt"
 
     private val httpClient by lazy {
-        val (sslFactory, trustManager) = AntiDpi.createConscryptSslContext()
+        val (sslFactory, trustManager) = AntiDpi.createSystemConscryptSslContext()
         OkHttpClient.Builder()
             .sslSocketFactory(sslFactory, trustManager)
-            .hostnameVerifier { _, _ -> true }
             .dns(AntiDpi.DohDns())
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)

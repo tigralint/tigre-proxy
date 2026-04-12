@@ -46,7 +46,6 @@ object Bridge {
             val tcpToWs = launch(Dispatchers.IO) {
                 try {
                     val buf = ByteArray(READ_BUF_SIZE)
-                    val outBuf = ByteArray(READ_BUF_SIZE)
                     while (isActive && !clientInput.isClosedForRead) {
                         val n = clientInput.readAvailable(buf)
                         if (n == -1) {
@@ -70,15 +69,15 @@ object Bridge {
                         }
                         upPackets++
 
-                        // Re-encrypt: ZERO ALLOCATION (mostly). client cipher → plaintext → telegram cipher
-                        // We use a shared outBuf to avoid allocating `plain`.
-                        // The final target buffer must be precisely sized for the WebSocket to send.
-                        ctx.cltDec.update(buf, 0, n, outBuf, 0)
-                        val tgCipher = ByteArray(n)
-                        ctx.tgEnc.update(outBuf, 0, n, tgCipher, 0)
+                        // Re-encrypt: ONE ALLOCATION PER READ. client cipher → plaintext → telegram cipher
+                        // Since we need a precisely sized array for WebSocket.send(), we allocate
+                        // targetBuf(n), decrypt into it, then encrypt it in-place.
+                        val targetBuf = ByteArray(n)
+                        ctx.cltDec.update(buf, 0, n, targetBuf, 0)
+                        ctx.tgEnc.update(targetBuf, 0, n, targetBuf, 0)
 
                         if (splitter != null) {
-                            val parts = splitter.split(tgCipher)
+                            val parts = splitter.split(targetBuf)
                             if (parts.isEmpty()) continue
                             if (parts.size > 1) {
                                 ws.sendBatch(parts)
@@ -86,7 +85,7 @@ object Bridge {
                                 ws.send(parts[0])
                             }
                         } else {
-                            ws.send(tgCipher)
+                            ws.send(targetBuf)
                         }
                     }
                 } catch (_: kotlinx.coroutines.CancellationException) {

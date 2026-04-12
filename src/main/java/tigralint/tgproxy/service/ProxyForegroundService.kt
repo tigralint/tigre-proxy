@@ -7,7 +7,9 @@ import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
+import android.content.pm.ServiceInfo
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -92,7 +94,12 @@ class ProxyForegroundService : Service() {
         if (_status.value == ProxyStatus.RUNNING || _status.value == ProxyStatus.STARTING) return
 
         _status.value = ProxyStatus.STARTING
-        startForeground(NOTIFICATION_ID, buildNotification("Starting proxy..."))
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            buildNotification("Starting proxy..."),
+            if (android.os.Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+        )
         acquireWakeLock()
 
         val server = TcpServer(config, _stats)

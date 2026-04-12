@@ -404,7 +404,7 @@ class TcpServer(
         } finally {
             stats.connectionsActive.decrementAndGet()
             stats.publishSnapshot()
-            try { client.close() } catch (_: Exception) {}
+            try { client.dispose() } catch (_: Exception) {}
         }
     }
 

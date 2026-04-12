@@ -5,6 +5,7 @@ import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.conscrypt.Conscrypt
+import org.json.JSONObject
 import java.net.InetAddress
 import java.security.SecureRandom
 import java.util.Base64
@@ -195,18 +196,17 @@ object AntiDpi {
          */
         private fun parseDnsJsonResponse(json: String): List<InetAddress> {
             val addresses = mutableListOf<InetAddress>()
-            // Find "Answer" array and extract "data" fields with type 1 (A record)
-            val answerIdx = json.indexOf("\"Answer\"")
-            if (answerIdx == -1) return emptyList()
-
-            // Simple regex to extract IP addresses from "data":"x.x.x.x" entries
-            val dataPattern = Regex("\"data\"\\s*:\\s*\"([\\d.]+)\"")
-            val section = json.substring(answerIdx)
-            for (match in dataPattern.findAll(section)) {
-                try {
-                    addresses.add(InetAddress.getByName(match.groupValues[1]))
-                } catch (_: Exception) {}
-            }
+            try {
+                val jsonObject = JSONObject(json)
+                val answerArray = jsonObject.optJSONArray("Answer") ?: return emptyList()
+                for (i in 0 until answerArray.length()) {
+                    val obj = answerArray.getJSONObject(i)
+                    // type 1 is A-record (IPv4)
+                    if (obj.getInt("type") == 1) {
+                        addresses.add(InetAddress.getByName(obj.getString("data")))
+                    }
+                }
+            } catch (_: Exception) {}
             return addresses
         }
     }
@@ -217,27 +217,38 @@ object AntiDpi {
 
     /**
      * Create a trust-all SSLSocketFactory using Conscrypt (BoringSSL).
-     * This ensures OkHttp uses the Chrome TLS stack instead of Java's default.
-     * Trust-all is needed because we connect to Telegram's IPs with different
-     * SNI domains (like Python's ssl.CERT_NONE behavior).
+     * This is only used for direct connections to Telegram IPs when the SNI
+     * doesn't match the IP's certificate (ssl.CERT_NONE equivalent).
      */
-    fun createConscryptSslContext(): Pair<javax.net.ssl.SSLSocketFactory, X509TrustManager> {
+    fun createTrustAllConscryptSslContext(): Pair<javax.net.ssl.SSLSocketFactory, X509TrustManager> {
         val trustAllManager = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
             override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
             override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
         }
+        return createSslContext(trustAllManager)
+    }
 
+    /**
+     * Create an SSLSocketFactory using Conscrypt with system trust validation.
+     * Prevents MITM attacks when connecting to Cloudflare Workers or GitHub.
+     */
+    fun createSystemConscryptSslContext(): Pair<javax.net.ssl.SSLSocketFactory, X509TrustManager> {
+        val factory = javax.net.ssl.TrustManagerFactory.getInstance(
+            javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm()
+        )
+        factory.init(null as java.security.KeyStore?)
+        val systemTrustManager = factory.trustManagers.first { it is X509TrustManager } as X509TrustManager
+        return createSslContext(systemTrustManager)
+    }
+
+    private fun createSslContext(trustManager: X509TrustManager): Pair<javax.net.ssl.SSLSocketFactory, X509TrustManager> {
         val sslContext = try {
-            // Try to get Conscrypt-backed SSLContext explicitly
             SSLContext.getInstance("TLS", Conscrypt.newProvider())
         } catch (e: Exception) {
-            // Fallback: if Conscrypt is installed as default provider,
-            // SSLContext.getInstance("TLS") will use it automatically
             SSLContext.getInstance("TLS")
         }
-
-        sslContext.init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
-        return Pair(sslContext.socketFactory, trustAllManager)
+        sslContext.init(null, arrayOf<TrustManager>(trustManager), SecureRandom())
+        return Pair(sslContext.socketFactory, trustManager)
     }
 }
