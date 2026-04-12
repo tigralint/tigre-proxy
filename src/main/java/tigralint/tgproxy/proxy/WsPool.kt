@@ -103,7 +103,7 @@ class WsPool(
     private suspend fun connectOne(targetIp: String, domains: List<String>): ProxyWebSocket? {
         for (domain in domains) {
             try {
-                return ProxyWebSocket.connect(targetIp, domain, timeoutMs = 8000)
+                return ProxyWebSocket.connect(targetIp, domain, timeoutMs = 8000, antiDpiEnabled = config.antiDpiEnabled)
             } catch (e: WsHandshakeError) {
                 if (e.isRedirect) continue
                 return null

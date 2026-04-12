@@ -82,6 +82,9 @@ dependencies {
     // OkHttp for WebSocket client
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Conscrypt (BoringSSL) — Chrome-like TLS fingerprint for DPI bypass
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
+
     // Ktor Network for async NIO TCP sockets
     implementation("io.ktor:ktor-network:3.0.0")
 

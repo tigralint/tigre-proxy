@@ -331,7 +331,7 @@ class TcpServer(
                 for (domain in domains) {
                     log("INFO", "[$label] DC$dc$mediaTag → wss://$domain/apiws via $target")
                     try {
-                        ws = ProxyWebSocket.connect(target, domain, timeoutMs = wsTimeout)
+                        ws = ProxyWebSocket.connect(target, domain, timeoutMs = wsTimeout, antiDpiEnabled = config.antiDpiEnabled)
                         allRedirects = false
                         break
                     } catch (e: WsHandshakeError) {
@@ -390,7 +390,8 @@ class TcpServer(
             // Start the bidirectional bridge
             Bridge.bridgeWsReencrypt(
                 clientInput, clientOutput, ws, label,
-                dc, isMedia, ctx, splitter, stats
+                dc, isMedia, ctx, splitter, stats,
+                trafficShaping = config.trafficShaping
             )
 
         } catch (_: kotlinx.coroutines.CancellationException) {

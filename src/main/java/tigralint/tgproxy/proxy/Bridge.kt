@@ -32,7 +32,8 @@ object Bridge {
         isMedia: Boolean,
         ctx: CryptoCtx,
         splitter: MsgSplitter?,
-        stats: ProxyStats
+        stats: ProxyStats,
+        trafficShaping: Boolean = false
     ) {
         val dcTag = "DC$dc${if (isMedia) "m" else ""}"
         var upBytes = 0L
@@ -61,6 +62,12 @@ object Bridge {
 
                         stats.bytesUp.addAndGet(n.toLong())
                         upBytes += n
+
+                        // Anti-DPI: traffic shaping micro-delays during handshake
+                        if (trafficShaping) {
+                            val shapeDelay = AntiDpi.trafficShapingDelayMs(upPackets)
+                            if (shapeDelay > 0) delay(shapeDelay)
+                        }
                         upPackets++
 
                         // Re-encrypt: ZERO ALLOCATION (mostly). client cipher → plaintext → telegram cipher
@@ -96,6 +103,12 @@ object Bridge {
                         stats.bytesDown.addAndGet(n.toLong())
                         downBytes += n
                         downPackets++
+
+                        // Anti-DPI: traffic shaping micro-delays during handshake
+                        if (trafficShaping) {
+                            val shapeDelay = AntiDpi.trafficShapingDelayMs(downPackets)
+                            if (shapeDelay > 0) delay(shapeDelay)
+                        }
 
                         // Re-encrypt IN-PLACE! (ZERO ALLOCATION)
                         // telegram cipher → plaintext → client cipher
@@ -259,7 +272,7 @@ object Bridge {
         for (baseDomain in listOf(active) + others) {
             val domain = "kws$dc.$baseDomain"
             try {
-                ws = ProxyWebSocket.connect(domain, domain, timeoutMs = 10000)
+                ws = ProxyWebSocket.connect(domain, domain, timeoutMs = 10000, antiDpiEnabled = config.antiDpiEnabled)
                 chosenDomain = baseDomain
                 break
             } catch (e: Exception) {
@@ -277,7 +290,7 @@ object Bridge {
         stats.connectionsCfProxy.incrementAndGet()
         ws.send(relayInit)
 
-        bridgeWsReencrypt(clientInput, clientOutput, ws, label, dc, isMedia, ctx, splitter, stats)
+        bridgeWsReencrypt(clientInput, clientOutput, ws, label, dc, isMedia, ctx, splitter, stats, trafficShaping = config.trafficShaping)
         return true
     }
 

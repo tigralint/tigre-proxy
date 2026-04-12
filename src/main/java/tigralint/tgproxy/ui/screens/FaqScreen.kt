@@ -71,6 +71,15 @@ fun FaqScreen(modifier: Modifier = Modifier) {
                     icon = Icons.Filled.Info,
                     isBlue = true
                 )
+                
+                HorizontalDivider(color = DividerColor, modifier = Modifier.padding(start = 56.dp))
+                
+                FaqItem(
+                    title = Texts.faqTitle4,
+                    text = Texts.faqText4,
+                    icon = Icons.Filled.Warning,
+                    isBlue = false
+                )
             }
         }
         

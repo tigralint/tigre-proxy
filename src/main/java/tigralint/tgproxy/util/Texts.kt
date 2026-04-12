@@ -30,6 +30,9 @@ object Texts {
     val antiBlock get() = if (isRu) "Режим Анти-блокировки" else "Anti-Block Mode"
     val antiBlockDesc get() = if (isRu) "Использовать скрытые пути для обхода блокировок РКН" else "Use hidden paths to bypass censorship"
     
+    val antiDpi get() = if (isRu) "Обход ТСПУ (Anti-DPI)" else "Anti-DPI / TSPU Bypass"
+    val antiDpiDesc get() = if (isRu) "Маскировка TLS-отпечатка под Chrome + Padding. Помогает при жестких блокировках." else "Chrome TLS fingerprint + Padding. Helps against strict mobile filtering."
+    
     val advancedSettings get() = if (isRu) "Продвинутые настройки (Для гиков)" else "Advanced Settings (For geeks)"
     
     val connection get() = if (isRu) "Подключение" else "Connection"
@@ -45,6 +48,12 @@ object Texts {
     val leaveEmptyAuto get() = if (isRu) "Пусто = публичные воркеры автора" else "Empty = public author workers"
     val dcMappings get() = if (isRu) "Маршрутизация DC → IP" else "DC → IP Mappings"
     val dcIps get() = if (isRu) "DC:IP (по одному на строку)" else "DC:IP (one per line)"
+
+    val useDoh get() = if (isRu) "DNS over HTTPS (ECH)" else "DNS over HTTPS (ECH)"
+    val useDohDesc get() = if (isRu) "Шифрует SNI через Cloudflare DoH. Предотвращает обнаружение домена." else "Encrypts SNI via DoH. Prevents domain-based detection."
+    
+    val useTrafficShaping get() = if (isRu) "Обфускация таймингов" else "Traffic Shaping"
+    val useTrafficShapingDesc get() = if (isRu) "Вносит микро-задержки в handshake для размытия сигнатур MTProto." else "Adds micro-delays to handshake to blur MTProto signatures."
     
     val system get() = if (isRu) "Система" else "System"
     val batteryOpt get() = if (isRu) "Фоновая работа" else "Background execution"
@@ -82,6 +91,11 @@ object Texts {
     val faqText3 get() = if (isRu)
         "Абсолютно. Прокси работает ТОЛЬКО локально на вашем телефоне. Вся магия обхода (шифрование, Cloudflare) происходит прямо на вашем устройстве, ключи шифрования в безопасности." else
         "Absolutely. The proxy runs strictly LOCALLY on your phone. All circumvention magic happens entirely on your device."
+
+    val faqTitle4 get() = if (isRu) "Прокси выключается сам по себе в фоне" else "Proxy kills itself in the background"
+    val faqText4 get() = if (isRu)
+        "На Huawei (EMUI) и Xiaomi (MIUI/HyperOS) агрессивный режим энергосбережения принудительно убивает прокси при выключении экрана. Чтобы исправить: Настройки -> Батарея -> Запуск приложений -> найдите Tigre Proxy -> отключите 'Управлять автоматически' и обязательно включите все 3 галочки внутри (Автозапуск, Работа в фоне). Также закрепите приложение 'замочком' в недавних." else
+        "On Huawei and Xiaomi, aggressive battery saving forcefully kills the proxy when the screen turns off. Fix it: Settings -> Battery -> App Launch -> find Tigre Proxy -> disable 'Manage automatically' and enable all 3 toggles (Auto-launch, Run in background). Also lock the app in recent apps."
 
     val developedBy get() = if (isRu) "Разработчик: @tigralint" else "Developer: @tigralint"
 }

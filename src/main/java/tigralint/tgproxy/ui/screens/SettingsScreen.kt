@@ -44,6 +44,10 @@ fun SettingsScreen(
         mutableStateOf(config.dcRedirects.entries.joinToString("\n") { "${it.key}:${it.value}" })
     }
     
+    var antiDpiEnabled by remember(config) { mutableStateOf(config.antiDpiEnabled) }
+    var dohEnabled by remember(config) { mutableStateOf(config.dohEnabled) }
+    var trafficShaping by remember(config) { mutableStateOf(config.trafficShaping) }
+    
     var showAdvanced by remember { mutableStateOf(false) }
 
     val scrollState = rememberScrollState()
@@ -127,6 +131,77 @@ fun SettingsScreen(
             color = TextSecondary,
             modifier = Modifier.padding(top = 8.dp, start = 16.dp, bottom = 24.dp)
         )
+
+        // --- ANTI-DPI SECTION ---
+        Text(
+            Texts.antiDpi.uppercase(),
+            style = MaterialTheme.typography.labelMedium,
+            color = TextSecondary,
+            modifier = Modifier.padding(bottom = 8.dp, start = 16.dp)
+        )
+        Card(
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = AppleSurface)
+        ) {
+            Column {
+                // Anti-DPI (BoringSSL + Padding)
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(Texts.antiDpi, style = MaterialTheme.typography.bodyLarge, color = TextPrimary)
+                        Text(Texts.antiDpiDesc, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    }
+                    Switch(
+                        checked = antiDpiEnabled,
+                        onCheckedChange = { antiDpiEnabled = it },
+                        enabled = !isRunning,
+                        colors = AppleSwitchColors()
+                    )
+                }
+                HorizontalDivider(color = DividerColor, modifier = Modifier.padding(start = 16.dp))
+                
+                // DoH (DNS over HTTPS / ECH)
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(Texts.useDoh, style = MaterialTheme.typography.bodyLarge, color = TextPrimary)
+                        Text(Texts.useDohDesc, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    }
+                    Switch(
+                        checked = dohEnabled,
+                        onCheckedChange = { dohEnabled = it },
+                        enabled = !isRunning,
+                        colors = AppleSwitchColors()
+                    )
+                }
+                HorizontalDivider(color = DividerColor, modifier = Modifier.padding(start = 16.dp))
+                
+                // Traffic Shaping
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(Texts.useTrafficShaping, style = MaterialTheme.typography.bodyLarge, color = TextPrimary)
+                        Text(Texts.useTrafficShapingDesc, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                    }
+                    Switch(
+                        checked = trafficShaping,
+                        onCheckedChange = { trafficShaping = it },
+                        enabled = !isRunning,
+                        colors = AppleSwitchColors()
+                    )
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(24.dp))
 
         // --- SYSTEM SECTION ---
         Text(
@@ -360,7 +435,10 @@ fun SettingsScreen(
                         fakeTlsDomain = fakeTlsDomain,
                         fallbackCfProxy = antiBlockEnabled,
                         cfProxyUserDomain = cfProxyDomain,
-                        dcRedirects = dcMap
+                        dcRedirects = dcMap,
+                        antiDpiEnabled = antiDpiEnabled,
+                        dohEnabled = dohEnabled,
+                        trafficShaping = trafficShaping
                     )
                 )
             },
@@ -375,6 +453,14 @@ fun SettingsScreen(
         Spacer(modifier = Modifier.height(40.dp))
     }
 }
+
+@Composable
+private fun AppleSwitchColors() = SwitchDefaults.colors(
+    checkedThumbColor = Color.White,
+    checkedTrackColor = AppleGreen,
+    uncheckedThumbColor = Color.White,
+    uncheckedTrackColor = AppleSurfaceVariant
+)
 
 @Composable
 private fun settingsTextFieldColors() = OutlinedTextFieldDefaults.colors(

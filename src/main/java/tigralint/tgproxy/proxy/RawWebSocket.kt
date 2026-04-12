@@ -6,20 +6,21 @@ import kotlinx.coroutines.withTimeout
 import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
- * WebSocket client wrapper using OkHttp.
+ * WebSocket client wrapper using OkHttp + Conscrypt (BoringSSL).
  * Port of raw_websocket.py — connects to Telegram's WSS endpoints
- * with proper SNI masking.
+ * with proper SNI masking and anti-DPI countermeasures.
+ *
+ * Anti-DPI features:
+ * - Conscrypt (BoringSSL) TLS engine → Chrome-like JA3/JA4 fingerprint
+ * - DNS-over-HTTPS resolver → ECH (Encrypted Client Hello) support
+ * - Random padding HTTP headers → breaks packet-size signatures
+ * - HTTP/2 protocol preference → avoids detectable HTTP/1.1 Upgrade pattern
  */
 class ProxyWebSocket private constructor(
     private val ws: WebSocket,
@@ -70,56 +71,85 @@ class ProxyWebSocket private constructor(
     class ConnectionException(message: String) : Exception(message)
 
     companion object {
-        // Trust-all SSL context (like Python's ssl.CERT_NONE)
-        private val trustAllManager = object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-        }
-
-        private val sslContext = SSLContext.getInstance("TLS").apply {
-            init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
-        }
-
-        private val baseClient = OkHttpClient.Builder()
-            .sslSocketFactory(sslContext.socketFactory, trustAllManager)
-            .hostnameVerifier { _, _ -> true }
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS)  // No read timeout for WS
-            .pingInterval(30, TimeUnit.SECONDS)
-            .build()
 
         /**
-         * Connect to a WebSocket endpoint.
+         * OkHttp client with Conscrypt (BoringSSL) TLS and DoH DNS.
+         *
+         * Key anti-DPI properties:
+         * - SSLSocketFactory from Conscrypt → Chrome-like cipher suites, extensions, ALPN
+         * - DNS-over-HTTPS → enables ECH (Encrypted Client Hello) on Cloudflare
+         * - HTTP/2 protocol → WebSocket muxed as H2 stream when server supports RFC 8441
+         * - Trust-all certs → needed for connecting to Telegram IPs with different SNI
+         */
+        private val antiDpiClient: OkHttpClient by lazy {
+            val (sslFactory, trustManager) = AntiDpi.createConscryptSslContext()
+            OkHttpClient.Builder()
+                .sslSocketFactory(sslFactory, trustManager)
+                .hostnameVerifier { _, _ -> true }
+                .dns(AntiDpi.DohDns()) // DNS-over-HTTPS for ECH support
+                .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.SECONDS)  // No read timeout for WS
+                .pingInterval(30, TimeUnit.SECONDS)
+                .build()
+        }
+
+        /**
+         * Legacy OkHttp client without anti-DPI (fallback).
+         */
+        private val legacyClient: OkHttpClient by lazy {
+            val (sslFactory, trustManager) = AntiDpi.createConscryptSslContext()
+            OkHttpClient.Builder()
+                .sslSocketFactory(sslFactory, trustManager)
+                .hostnameVerifier { _, _ -> true }
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.SECONDS)
+                .pingInterval(30, TimeUnit.SECONDS)
+                .build()
+        }
+
+        /**
+         * Connect to a WebSocket endpoint with anti-DPI countermeasures.
          *
          * @param host The actual IP/hostname to connect to
          * @param domain The SNI domain for TLS and Host header
          * @param timeoutMs Connection timeout in milliseconds
+         * @param antiDpiEnabled Whether to apply anti-DPI countermeasures
          */
         suspend fun connect(
             host: String,
             domain: String,
-            timeoutMs: Long = 10000
+            timeoutMs: Long = 10000,
+            antiDpiEnabled: Boolean = true
         ): ProxyWebSocket = withTimeout(timeoutMs) {
             suspendCancellableCoroutine { cont ->
                 val url = "wss://$host/apiws"
+                val client = if (antiDpiEnabled) antiDpiClient else legacyClient
 
-                val request = Request.Builder()
+                val requestBuilder = Request.Builder()
                     .url(url)
                     .header("Host", domain)
                     .header("Sec-WebSocket-Protocol", "binary")
-                    .header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Linux; Android 14; Pixel 8) " +
-                                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                                "Chrome/131.0.0.0 Mobile Safari/537.36"
-                    )
-                    .build()
 
+                if (antiDpiEnabled) {
+                    // Apply anti-DPI padding headers
+                    val paddingHeaders = AntiDpi.generatePaddingHeaders()
+                    for ((key, value) in paddingHeaders) {
+                        requestBuilder.header(key, value)
+                    }
+                } else {
+                    // Minimal headers without padding
+                    requestBuilder.header(
+                        "User-Agent",
+                        AntiDpi.randomUserAgent()
+                    )
+                }
+
+                val request = requestBuilder.build()
                 val recvChannel = Channel<ByteArray>(Channel.UNLIMITED)
                 var connected = false
 
-                val ws = baseClient.newWebSocket(request, object : WebSocketListener() {
+                val ws = client.newWebSocket(request, object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         connected = true
                         val proxy = ProxyWebSocket(webSocket, recvChannel)
@@ -170,3 +200,4 @@ class WsHandshakeError(
 ) : Exception("WS handshake failed: HTTP $statusCode $statusLine") {
     val isRedirect: Boolean get() = statusCode in listOf(301, 302, 303, 307, 308)
 }
+

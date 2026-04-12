@@ -24,13 +24,23 @@ data class ProxyConfig(
     var cfProxyDomains: MutableList<String> = mutableListOf(),
     var activeCfProxyDomain: String = "",
     var fakeTlsDomain: String = "",
+    // Anti-DPI / TSPU bypass settings
+    var antiDpiEnabled: Boolean = true,      // Enable Chrome-like TLS fingerprint + padding
+    var dohEnabled: Boolean = true,           // DNS-over-HTTPS for ECH support
+    var dohServer: String = "https://1.1.1.1/dns-query",
+    var trafficShaping: Boolean = true,       // Micro-delays during handshake to blur timing
+
 ) {
     companion object {
         private const val CFPROXY_DOMAINS_URL =
             "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt"
 
         private val httpClient by lazy {
+            val (sslFactory, trustManager) = AntiDpi.createConscryptSslContext()
             OkHttpClient.Builder()
+                .sslSocketFactory(sslFactory, trustManager)
+                .hostnameVerifier { _, _ -> true }
+                .dns(AntiDpi.DohDns())
                 .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .build()

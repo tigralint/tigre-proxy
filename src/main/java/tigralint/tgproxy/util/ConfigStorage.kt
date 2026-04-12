@@ -14,6 +14,9 @@ object ConfigStorage {
     private const val KEY_ANTI_BLOCK = "anti_block"
     private const val KEY_CF_DOMAIN = "cf_domain"
     private const val KEY_DC_MAPPINGS = "dc_mappings"
+    private const val KEY_ANTI_DPI = "anti_dpi"
+    private const val KEY_DOH = "doh_enabled"
+    private const val KEY_TRAFFIC_SHAPING = "traffic_shaping"
 
     fun save(context: Context, config: ProxyConfig) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -27,6 +30,11 @@ object ConfigStorage {
             // Serialize DC mappings: "2:IP,4:IP"
             val mappings = config.dcRedirects.entries.joinToString(",") { "${it.key}:${it.value}" }
             putString(KEY_DC_MAPPINGS, mappings)
+            
+            // Anti-DPI settings
+            putBoolean(KEY_ANTI_DPI, config.antiDpiEnabled)
+            putBoolean(KEY_DOH, config.dohEnabled)
+            putBoolean(KEY_TRAFFIC_SHAPING, config.trafficShaping)
             
             apply()
         }
@@ -62,6 +70,11 @@ object ConfigStorage {
                 config.dcRedirects = map
             }
         }
+        
+        // Anti-DPI settings
+        config.antiDpiEnabled = prefs.getBoolean(KEY_ANTI_DPI, true)
+        config.dohEnabled = prefs.getBoolean(KEY_DOH, true)
+        config.trafficShaping = prefs.getBoolean(KEY_TRAFFIC_SHAPING, true)
         
         return config
     }
