@@ -43,9 +43,11 @@ object Texts {
     val egGoogle get() = if (isRu) "напр. google.com" else "e.g. google.com"
     val leaveEmptyFakeTls get() = if (isRu) "Оставьте пустым для отключения" else "Leave empty to disable"
     val cfFallback get() = if (isRu) "Фолбэк через Cloudflare" else "Cloudflare Fallback"
+    val cfPriority get() = if (isRu) "Приоритет Cloudflare" else "Cloudflare Priority"
+    val cfPriorityDesc get() = if (isRu) "Сразу идти через воркер, не дожидаясь таймаутов прямой связи. Полезно для друзей." else "Connect via Worker immediately. Useful for friends behind strict blocks."
     val enableCf get() = if (isRu) "Включить CF Прокси" else "Enable CF Proxy"
-    val customCfDomain get() = if (isRu) "Кастомный CF Воpкер" else "Custom CF Worker Domain"
-    val leaveEmptyAuto get() = if (isRu) "Пусто = публичные воркеры автора" else "Empty = public author workers"
+    val customCfDomain = if (isRu) "Свой Cloudflare Worker" else "Custom Cloudflare Worker"
+    val leaveEmptyAuto = if (isRu) "Пусто = публичные шлюзы автора" else "Leave empty for public gateways"
     val dcMappings get() = if (isRu) "Маршрутизация DC → IP" else "DC → IP Mappings"
     val dcIps get() = if (isRu) "DC:IP (по одному на строку)" else "DC:IP (one per line)"
 
@@ -84,8 +86,8 @@ object Texts {
     
     val faqTitle2 get() = if (isRu) "Что делать, если прокси не коннектится?" else "What if the proxy won't connect?"
     val faqText2 get() = if (isRu) 
-        "Убедитесь, что 'Режим Анти-блокировки' включен (это использует сеть Cloudflare для обхода). Если публичные пути заблокированы, вы можете развернуть свой бесплатный Cloudflare Worker и вписать его в поле 'Кастомный CF Воркер' в Продвинутых настройках." else 
-        "Ensure 'Anti-Block Mode' is enabled. If public routes are blocked by your ISP, you can deploy your own free Cloudflare Worker and enter its domain in Advanced Settings."
+        "Убедитесь, что 'Режим Анти-блокировки' включен. Если поле 'Свой Cloudflare Worker' пустое, приложение само найдет и использует рабочие публичные шлюзы сообщества." else 
+        "Ensure 'Anti-Block Mode' is enabled. If the 'Custom Cloudflare Worker' field is empty, the app will automatically find and use working public community gateways."
 
     val faqTitle3 get() = if (isRu) "Это безопасно?" else "Is it safe?"
     val faqText3 get() = if (isRu)

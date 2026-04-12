@@ -39,6 +39,7 @@ fun SettingsScreen(
     var port by remember(config) { mutableStateOf(config.port.toString()) }
     var fakeTlsDomain by remember(config) { mutableStateOf(config.fakeTlsDomain) }
     var antiBlockEnabled by remember(config) { mutableStateOf(config.fallbackCfProxy) }
+    var cfPriorityEnabled by remember(config) { mutableStateOf(config.fallbackCfProxyPriority) }
     var cfProxyDomain by remember(config) { mutableStateOf(config.cfProxyUserDomain) }
     var dcIps by remember(config) {
         mutableStateOf(config.dcRedirects.entries.joinToString("\n") { "${it.key}:${it.value}" })
@@ -127,6 +128,39 @@ fun SettingsScreen(
         
         Text(
             Texts.antiBlockDesc,
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSecondary,
+            modifier = Modifier.padding(top = 8.dp, start = 16.dp, bottom = 12.dp)
+        )
+
+        Card(
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = AppleSurface)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(Texts.cfPriority, style = MaterialTheme.typography.bodyLarge, color = TextPrimary)
+                Switch(
+                    checked = cfPriorityEnabled,
+                    onCheckedChange = { cfPriorityEnabled = it },
+                    enabled = !isRunning && antiBlockEnabled,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Color.White,
+                        checkedTrackColor = AppleGreen,
+                        uncheckedThumbColor = Color.White,
+                        uncheckedTrackColor = AppleSurfaceVariant
+                    )
+                )
+            }
+        }
+
+        Text(
+            Texts.cfPriorityDesc,
             style = MaterialTheme.typography.bodySmall,
             color = TextSecondary,
             modifier = Modifier.padding(top = 8.dp, start = 16.dp, bottom = 24.dp)
@@ -337,7 +371,46 @@ fun SettingsScreen(
                 Column {
                     OutlinedTextField(
                         value = secret,
-                        onValueChange = { if (it.length <= 32) secret = it.filter { c -> c in "0123456789abcdefABCDEF" } },
+                        onValueChange = { input ->
+                            val cleanInput = input.trim()
+                            if (cleanInput.startsWith("tg://proxy?") || cleanInput.startsWith("https://t.me/proxy?")) {
+                                // Full link parsing
+                                val uri = Uri.parse(cleanInput.replace("https://t.me/proxy?", "tg://proxy?"))
+                                val s = uri.getQueryParameter("secret")
+                                val p = uri.getQueryParameter("port")
+                                if (s != null) {
+                                    if (s.startsWith("ee") && s.length >= 34) {
+                                        secret = s.substring(2, 34)
+                                        val domainHex = s.substring(34)
+                                        if (domainHex.isNotEmpty()) {
+                                            try {
+                                                fakeTlsDomain = String(
+                                                    domainHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                                                )
+                                            } catch (_: Exception) {}
+                                        }
+                                    } else if (s.startsWith("dd")) {
+                                        secret = s.substring(2).take(32)
+                                    } else {
+                                        secret = s.take(32)
+                                    }
+                                }
+                                if (p != null) port = p
+                            } else if (cleanInput.startsWith("ee") && cleanInput.length >= 34) {
+                                secret = cleanInput.substring(2, 34)
+                                val domainHex = cleanInput.substring(34)
+                                try {
+                                    fakeTlsDomain = String(
+                                        domainHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                                    )
+                                } catch (_: Exception) {}
+                            } else if (cleanInput.startsWith("dd")) {
+                                secret = cleanInput.substring(2).take(32).filter { it in "0123456789abcdefABCDEF" }
+                            } else {
+                                val filtered = cleanInput.filter { it in "0123456789abcdefABCDEF" }
+                                if (filtered.length <= 32) secret = filtered
+                            }
+                        },
                         label = { Text(Texts.secret) },
                         modifier = Modifier.fillMaxWidth().padding(16.dp),
                         enabled = !isRunning,
@@ -345,7 +418,7 @@ fun SettingsScreen(
                         colors = settingsTextFieldColors(),
                         trailingIcon = {
                             IconButton(onClick = { secret = ProxyConfig.generateSecret() }, enabled = !isRunning) {
-                                Icon(Icons.Filled.Refresh, "Generate", tint = AppleBlue)
+                                Icon(Icons.Filled.AutoFixHigh, "Generate", tint = AppleBlue)
                             }
                         }
                     )
@@ -434,6 +507,7 @@ fun SettingsScreen(
                         port = parsedPort,
                         fakeTlsDomain = fakeTlsDomain,
                         fallbackCfProxy = antiBlockEnabled,
+                        fallbackCfProxyPriority = cfPriorityEnabled,
                         cfProxyUserDomain = cfProxyDomain,
                         dcRedirects = dcMap,
                         antiDpiEnabled = antiDpiEnabled,

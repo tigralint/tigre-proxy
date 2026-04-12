@@ -123,7 +123,15 @@ class ProxyWebSocket private constructor(
             antiDpiEnabled: Boolean = true
         ): ProxyWebSocket = withTimeout(timeoutMs) {
             suspendCancellableCoroutine { cont ->
-                val url = "wss://$host/apiws"
+                // For Cloudflare Workers (path-based routing), 'host' contains the path like 'domain.com/dc1'.
+                // For target IPs (standard mode), 'host' is just an IP.
+                val connectTarget = if (antiDpiEnabled) domain else host
+                
+                val url = if (host.contains("/")) {
+                    "wss://$host" // Use path from host (e.g. wss://domain.com/dc1)
+                } else {
+                    "wss://$connectTarget/apiws"
+                }
                 val client = if (antiDpiEnabled) antiDpiClient else legacyClient
 
                 val requestBuilder = Request.Builder()

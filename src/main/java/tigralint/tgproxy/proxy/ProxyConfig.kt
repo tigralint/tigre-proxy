@@ -13,13 +13,16 @@ data class ProxyConfig(
     var host: String = "127.0.0.1",
     var secret: String = generateSecret(),
     var dcRedirects: MutableMap<Int, String> = mutableMapOf(
+        1 to "149.154.175.50",
         2 to "149.154.167.220",
-        4 to "149.154.167.220"
+        3 to "149.154.175.100",
+        4 to "91.108.4.218",
+        5 to "91.108.56.143"
     ),
     var bufferSize: Int = 256 * 1024,
     var poolSize: Int = 4,
     var fallbackCfProxy: Boolean = true,
-    var fallbackCfProxyPriority: Boolean = true,
+    var fallbackCfProxyPriority: Boolean = false,
     var cfProxyUserDomain: String = "",
     var cfProxyDomains: MutableList<String> = mutableListOf(),
     var activeCfProxyDomain: String = "",
@@ -31,88 +34,35 @@ data class ProxyConfig(
     var trafficShaping: Boolean = true,       // Micro-delays during handshake to blur timing
 
 ) {
+    /** Initialize CF proxy domains on start. */
+    fun initCfProxyDomains() {
+        if (cfProxyUserDomain.isNotEmpty()) {
+            cfProxyDomains = mutableListOf(cfProxyUserDomain)
+            activeCfProxyDomain = cfProxyUserDomain
+        } else if (cfProxyDomains.isEmpty()) {
+            cfProxyDomains = CfProxyManager.defaultDomains.toMutableList()
+            activeCfProxyDomain = cfProxyDomains.random()
+        }
+    }
+
     companion object {
-        private const val CFPROXY_DOMAINS_URL =
-            "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt"
-
-        private val httpClient by lazy {
-            val (sslFactory, trustManager) = AntiDpi.createConscryptSslContext()
-            OkHttpClient.Builder()
-                .sslSocketFactory(sslFactory, trustManager)
-                .hostnameVerifier { _, _ -> true }
-                .dns(AntiDpi.DohDns())
-                .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-                .build()
-        }
-
-        /** Domain suffix for CF proxy decoding. */
-        private val SUFFIX = buildString {
-            append(46.toChar())  // .
-            append(99.toChar())  // c
-            append(111.toChar()) // o
-            append(46.toChar())  // .
-            append(117.toChar()) // u
-            append(107.toChar()) // k
-        }
-
-        private val ENCODED_DEFAULTS = listOf(
-            "virkgj.com", "vmmzovy.com", "mkuosckvso.com", "zaewayzmplad.com", "twdmbzcm.com"
-        )
-
-        /** Decode CF proxy domain from encoded form. Port of _dd() from config.py. */
-        fun decodeDomain(s: String): String {
-            if (!s.endsWith(".com")) return s
-            val prefix = s.dropLast(4)
-            val n = prefix.count { it.isLetter() }
-            val decoded = prefix.map { c ->
-                if (c.isLetter()) {
-                    val base = if (c > '`') 97 else 65
-                    ((c.code - base - n).mod(26) + base).toChar()
-                } else c
-            }.joinToString("")
-            return decoded + SUFFIX
-        }
-
-        val DEFAULT_CF_DOMAINS: List<String> = ENCODED_DEFAULTS.map { decodeDomain(it) }
-
         fun generateSecret(): String {
             val bytes = ByteArray(16)
             SecureRandom().nextBytes(bytes)
             return bytes.joinToString("") { "%02x".format(it) }
         }
-
-        /**
-         * Fetch CF proxy domain list from GitHub.
-         * @return decoded domain list, or empty on failure
-         */
-        fun fetchCfProxyDomains(): List<String> {
-            return try {
-                val random = (1..7).map { ('a'..'z').random() }.joinToString("")
-                val request = Request.Builder()
-                    .url("$CFPROXY_DOMAINS_URL?$random")
-                    .header("User-Agent", "tg-ws-proxy-android")
-                    .build()
-                val response = httpClient.newCall(request).execute()
-                val text = response.body?.string() ?: ""
-                text.lines()
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() && !it.startsWith('#') }
-                    .map { decodeDomain(it) }
-            } catch (_: Exception) {
-                emptyList()
-            }
-        }
     }
 
-    /** Initialize CF proxy domains on first start. */
-    fun initCfProxyDomains() {
-        if (cfProxyUserDomain.isNotEmpty()) {
-            cfProxyDomains = mutableListOf(cfProxyUserDomain)
-            activeCfProxyDomain = cfProxyUserDomain
-        } else {
-            cfProxyDomains = DEFAULT_CF_DOMAINS.toMutableList()
-            activeCfProxyDomain = DEFAULT_CF_DOMAINS.random()
-        }
+    /**
+     * Generate tg://proxy link for this configuration.
+     * Uses 'ee' prefix for FakeTLS (modern padded format) or 'dd' for standard.
+     */
+    fun toTgLink(actualHost: String): String {
+        val type = if (fakeTlsDomain.isNotEmpty()) "ee" else "dd"
+        val domainHex = if (fakeTlsDomain.isNotEmpty()) {
+            fakeTlsDomain.toByteArray(Charsets.US_ASCII).joinToString("") { "%02x".format(it) }
+        } else ""
+        
+        return "tg://proxy?server=$actualHost&port=$port&secret=$type$secret$domainHex"
     }
 }

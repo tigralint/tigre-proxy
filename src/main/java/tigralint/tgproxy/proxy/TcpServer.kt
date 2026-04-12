@@ -24,7 +24,7 @@ class TcpServer(
     companion object {
         private const val TAG = "TcpServer"
         private const val DC_FAIL_COOLDOWN_MS = 30_000L
-        private const val WS_FAIL_TIMEOUT_MS = 2_000L
+        private const val WS_FAIL_TIMEOUT_MS = 6000L
     }
 
     private var serverSocket: ServerSocket? = null
@@ -62,18 +62,21 @@ class TcpServer(
         wsBlacklist.clear()
         dcFailUntil.clear()
 
+        // CF Proxy fallback logic
         if (config.fallbackCfProxy) {
             config.initCfProxyDomains()
-            // Background domain refresh
+            // Background domain refresh from GitHub
             serverScope.launch {
                 while (isActive) {
-                    delay(3600_000) // Refresh every hour
-                    val fetched = ProxyConfig.fetchCfProxyDomains()
+                    val fetched = CfProxyManager.fetchDomains()
                     if (fetched.isNotEmpty()) {
                         config.cfProxyDomains = fetched.toMutableList()
-                        config.activeCfProxyDomain = fetched.random()
+                        if (config.cfProxyUserDomain.isEmpty()) {
+                            config.activeCfProxyDomain = fetched.random()
+                        }
                         log("INFO", "CF proxy domains refreshed: ${fetched.size} domains")
                     }
+                    delay(3600_000) // Every hour after initial fetch
                 }
             }
         }
@@ -95,15 +98,9 @@ class TcpServer(
 
         // Generate connect link
         val ftls = config.fakeTlsDomain
-        if (ftls.isNotEmpty()) {
-            val domainHex = ftls.toByteArray(Charsets.US_ASCII)
-                .joinToString("") { "%02x".format(it) }
-            log("INFO", "Connect: tg://proxy?server=${config.host}&port=${config.port}&secret=ee${config.secret}$domainHex")
-        } else {
-            log("INFO", "Connect: tg://proxy?server=${config.host}&port=${config.port}&secret=dd${config.secret}")
-        }
-
-        log("INFO", "════════════════════════════════════════")
+        val link = config.toTgLink(config.host)
+        log("INFO", "Connect: $link")
+        log("INFO", "==================================================")
         log("INFO", "  Telegram MTProto WS Bridge Proxy")
         log("INFO", "  Listening on ${config.host}:${config.port}")
         log("INFO", "  Secret: ${config.secret}")
@@ -217,7 +214,7 @@ class TcpServer(
                 val tlsResult = FakeTls.verifyClientHello(clientHello, secret)
 
                 if (tlsResult == null) {
-                    log("DEBUG", "[$label] Fake TLS verify failed → masking to $masking")
+                    log("INFO", "[$label] Fake TLS handshake failed (Invalid HMAC or timestamp) → forwarding to masking domain")
                     // Proxy to masking domain (transparent pass-through)
                     proxyToMaskingDomain(input, output, clientHello, masking, label)
                     return
@@ -292,15 +289,21 @@ class TcpServer(
             val ctx = setupCryptoCtx(clientDecPrekeyIv, secret, relayInit)
 
             val dcKey = "$dc${if (isMedia) "m" else ""}"
+            val splitter = try { MsgSplitter(relayInit, protoInt) } catch (_: Exception) { null }
 
-            // Fallback if DC not in config or WS blacklisted
+            // Try CF Priority if enabled
+            if (config.fallbackCfProxy && config.fallbackCfProxyPriority) {
+                log("INFO", "[$label] DC$dc$mediaTag (CF Priority) → trying fallback first")
+                if (Bridge.doFallback(clientInput, clientOutput, relayInit, label, dc, isMedia, ctx, splitter, config, stats)) return
+            }
+
+            // Fallback if DC not mapped or blacklisted
             if (dc !in config.dcRedirects || dcKey in wsBlacklist) {
                 if (dc !in config.dcRedirects) {
                     log("INFO", "[$label] DC$dc not in config → fallback")
                 } else {
                     log("INFO", "[$label] DC$dc$mediaTag WS blacklisted → fallback")
                 }
-                val splitter = try { MsgSplitter(relayInit, protoInt) } catch (_: Exception) { null }
                 val ok = Bridge.doFallback(
                     clientInput, clientOutput, relayInit, label,
                     dc, isMedia, ctx, splitter, config, stats

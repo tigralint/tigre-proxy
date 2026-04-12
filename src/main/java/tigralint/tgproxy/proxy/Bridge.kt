@@ -261,29 +261,44 @@ object Bridge {
         stats: ProxyStats
     ): Boolean {
         val mediaTag = if (isMedia) " media" else ""
+        
+        val userDomain = config.cfProxyUserDomain
+        if (userDomain.isEmpty() && config.cfProxyDomains.isEmpty()) return false
+
         val active = config.activeCfProxyDomain
         val others = config.cfProxyDomains.filter { it != active }
+        val prioritizedList = mutableListOf<String>()
+        
+        if (userDomain.isNotEmpty()) prioritizedList.add(userDomain)
+        if (active.isNotEmpty() && active != userDomain) prioritizedList.add(active)
+        others.forEach { if (it != userDomain && it != active) prioritizedList.add(it) }
 
         var ws: ProxyWebSocket? = null
         var chosenDomain: String? = null
 
-        Log.i(TAG, "[$label] DC$dc$mediaTag → trying CF proxy")
+        Log.i(TAG, "[$label] DC$dc$mediaTag → trying CF proxy (options: ${prioritizedList.size})")
 
-        for (baseDomain in listOf(active) + others) {
-            val domain = "kws$dc.$baseDomain"
+        for (baseDomain in prioritizedList) {
+            // Using path-based routing (e.g., domain/dc2)
+            val connectTarget = if (baseDomain.contains("/")) {
+                if (baseDomain.endsWith("/")) "${baseDomain}dc$dc" else "$baseDomain/dc$dc"
+            } else {
+                "$baseDomain/dc$dc"
+            }
+
             try {
-                ws = ProxyWebSocket.connect(domain, domain, timeoutMs = 10000, antiDpiEnabled = config.antiDpiEnabled)
+                ws = ProxyWebSocket.connect(connectTarget, baseDomain.split("/")[0], timeoutMs = 10000, antiDpiEnabled = config.antiDpiEnabled)
                 chosenDomain = baseDomain
                 break
             } catch (e: Exception) {
-                Log.w(TAG, "[$label] DC$dc$mediaTag CF proxy failed: $e")
+                Log.w(TAG, "[$label] DC$dc$mediaTag CF proxy failed ($baseDomain): $e")
             }
         }
 
         if (ws == null) return false
 
-        if (chosenDomain != null && chosenDomain != config.activeCfProxyDomain) {
-            Log.i(TAG, "[$label] Switching active CF domain to $chosenDomain")
+        if (chosenDomain != null && config.cfProxyUserDomain.isEmpty() && chosenDomain != config.activeCfProxyDomain) {
+            Log.i(TAG, "[$label] Switching active public CF domain to $chosenDomain")
             config.activeCfProxyDomain = chosenDomain
         }
 

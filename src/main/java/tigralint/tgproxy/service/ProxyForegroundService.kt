@@ -220,13 +220,6 @@ class ProxyForegroundService : Service() {
      * Generate the tg:// proxy link for sharing.
      */
     fun getProxyLink(): String {
-        val ftls = config.fakeTlsDomain
-        return if (ftls.isNotEmpty()) {
-            val domainHex = ftls.toByteArray(Charsets.US_ASCII)
-                .joinToString("") { "%02x".format(it) }
-            "tg://proxy?server=${config.host}&port=${config.port}&secret=ee${config.secret}$domainHex"
-        } else {
-            "tg://proxy?server=${config.host}&port=${config.port}&secret=dd${config.secret}"
-        }
+        return config.toTgLink(config.host)
     }
 }
