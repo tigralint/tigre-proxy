@@ -30,7 +30,7 @@ object FakeTls {
     private const val CLIENT_RANDOM_LEN = 32
     private const val SESSION_ID_OFFSET = 44
     private const val SESSION_ID_LEN = 32
-    private const val TIMESTAMP_TOLERANCE = 120
+    private const val TIMESTAMP_TOLERANCE = 300
     const val TLS_APPDATA_MAX = 16384
 
     /** Pre-allocated 5-byte TLS record header template [0x17, 0x03, 0x03, 0x00, 0x00] */
@@ -209,7 +209,7 @@ object FakeTls {
      * FIXED: Uses structured concurrency via [scope] parameter instead of GlobalScope.
      */
     fun unwrapFakeTls(source: ByteReadChannel, scope: CoroutineScope): ByteReadChannel {
-        return scope.writer(Dispatchers.IO, autoFlush = true) {
+        return scope.writer(Dispatchers.IO, autoFlush = false) {
             val dest = channel
             // Reusable header buffer — zero allocation in the loop
             val hdr = ByteArray(5)
@@ -292,7 +292,9 @@ object FakeTls {
 
                     // Write payload directly from our reused buffer (zero-alloc)
                     destination.writeFully(buf, 0, n)
-                    destination.flush()
+                    // No explicit flush — parent channel batches writes.
+                    // With autoFlush=false, Ktor flushes when buffer fills (~4KB),
+                    // giving natural batching for high-throughput media downloads.
                     recordIndex++
                 }
             } catch (_: kotlinx.coroutines.CancellationException) {
@@ -300,24 +302,4 @@ object FakeTls {
         }.channel
     }
 
-    // ===== Legacy unwrap/wrap (old API without scope — DEPRECATED) =====
-    // Kept temporarily for backward compatibility. Callers should migrate to scoped versions.
-
-    /**
-     * @deprecated Use unwrapFakeTls(source, scope) instead for structured concurrency.
-     */
-    @Deprecated("Use unwrapFakeTls(source, scope) for structured concurrency", ReplaceWith("unwrapFakeTls(source, scope)"))
-    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
-    fun unwrapFakeTls(source: ByteReadChannel): ByteReadChannel {
-        return unwrapFakeTls(source, kotlinx.coroutines.GlobalScope)
-    }
-
-    /**
-     * @deprecated Use wrapFakeTls(destination, scope) instead for structured concurrency.
-     */
-    @Deprecated("Use wrapFakeTls(destination, scope) for structured concurrency", ReplaceWith("wrapFakeTls(destination, scope)"))
-    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
-    fun wrapFakeTls(destination: ByteWriteChannel): ByteWriteChannel {
-        return wrapFakeTls(destination, kotlinx.coroutines.GlobalScope)
-    }
 }

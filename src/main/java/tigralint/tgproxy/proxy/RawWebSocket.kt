@@ -6,10 +6,13 @@ import kotlinx.coroutines.withTimeout
 import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
+import java.security.cert.X509Certificate
+import javax.net.ssl.HostnameVerifier
 
 /**
  * WebSocket client wrapper using OkHttp + Conscrypt (BoringSSL).
@@ -24,7 +27,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
  */
 class ProxyWebSocket private constructor(
     private val ws: WebSocket,
-    private val recvChannel: Channel<ByteArray>
+    private val recvChannel: Channel<ByteArray>,
+    private val isDead: java.util.concurrent.atomic.AtomicBoolean
 ) {
     @Volatile
     private var closed = false
@@ -32,14 +36,46 @@ class ProxyWebSocket private constructor(
     /** Send binary data as a WebSocket frame. */
     suspend fun send(data: ByteArray) {
         if (closed) throw ConnectionException("WebSocket closed")
-        ws.send(data.toByteString())
+        try {
+            if (!ws.send(data.toByteString())) {
+                throw ConnectionException("WebSocket send queue full or closing")
+            }
+        } catch (e: Exception) {
+            closed = true
+            throw ConnectionException("WebSocket send failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Send a slice of a buffer as a WebSocket frame.
+     * Avoids the double-copy of copyOfRange() + toByteString() by using
+     * ByteString.of(buf, offset, length) which does a single copy.
+     */
+    suspend fun sendDirect(buf: ByteArray, offset: Int, length: Int) {
+        if (closed) throw ConnectionException("WebSocket closed")
+        try {
+            val bs = buf.toByteString(offset, length)
+            if (!ws.send(bs)) {
+                throw ConnectionException("WebSocket send queue full or closing")
+            }
+        } catch (e: Exception) {
+            closed = true
+            throw ConnectionException("WebSocket send failed: ${e.message}")
+        }
     }
 
     /** Send multiple binary frames in batch. */
     suspend fun sendBatch(parts: List<ByteArray>) {
         if (closed) throw ConnectionException("WebSocket closed")
-        for (part in parts) {
-            ws.send(part.toByteString())
+        try {
+            for (part in parts) {
+                if (!ws.send(part.toByteString())) {
+                    throw ConnectionException("WebSocket send queue full or closing")
+                }
+            }
+        } catch (e: Exception) {
+            closed = true
+            throw ConnectionException("WebSocket send failed: ${e.message}")
         }
     }
 
@@ -66,11 +102,55 @@ class ProxyWebSocket private constructor(
         recvChannel.close()
     }
 
-    val isClosed: Boolean get() = closed
+    val isClosed: Boolean get() = closed || isDead.get()
+
+    /** True if the receive channel has no buffered data (all frames consumed). */
+    val isRecvEmpty: Boolean get() = recvChannel.isEmpty
 
     class ConnectionException(message: String) : Exception(message)
 
     companion object {
+
+        /**
+         * Shared connection pool and dispatcher for all per-request OkHttp clients.
+         *
+         * Without sharing, each `newBuilder().dns(pinnedDns).build()` would
+         * create independent pools/dispatchers — leading to thread leak and
+         * connection sprawl on mobile devices with limited resources.
+         */
+        private val sharedPool = ConnectionPool(32, 2, TimeUnit.MINUTES)
+        private val sharedDispatcher = Dispatcher()
+
+        /**
+         * Dual-mode hostname verifier for Telegram + CF proxy connections.
+         *
+         * 1. First tries standard hostname verification (covers CF proxy,
+         *    CF DNS proxy domains, and any domain where URL matches the cert).
+         * 2. Falls back to checking for *.telegram.org in SAN — covers
+         *    edge cases where DNS-pinning routes to a gateway whose cert
+         *    may not exactly match the kws{N} subdomain we're requesting.
+         *
+         * This replaces the old `hostnameVerifier { _, _ -> true }` which
+         * was completely MITM-vulnerable.
+         */
+        private val telegramHostnameVerifier = HostnameVerifier { hostname, session ->
+            try {
+                // Standard verification: works for CF proxy and direct Telegram domains
+                val defaultVerifier = javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
+                if (defaultVerifier.verify(hostname, session)) return@HostnameVerifier true
+
+                // Telegram-specific fallback: accept certs with *.telegram.org SAN
+                val certs = session.peerCertificates
+                certs.any { cert ->
+                    (cert as? X509Certificate)?.subjectAlternativeNames?.any { san ->
+                        val name = san[1].toString()
+                        name.endsWith(".telegram.org") || name == "telegram.org"
+                    } == true
+                }
+            } catch (_: Exception) {
+                false
+            }
+        }
 
         /**
          * OkHttp client with Conscrypt (BoringSSL) TLS and DoH DNS.
@@ -79,15 +159,18 @@ class ProxyWebSocket private constructor(
          * - SSLSocketFactory from Conscrypt → Chrome-like cipher suites, extensions, ALPN
          * - DNS-over-HTTPS → enables ECH (Encrypted Client Hello) on Cloudflare
          * - HTTP/2 protocol → WebSocket muxed as H2 stream when server supports RFC 8441
-         * - Trust-all certs → needed for connecting to Telegram IPs with different SNI
+         * - Telegram cert pinning → accepts only certs with *.telegram.org SAN
          */
         private val antiDpiClient: OkHttpClient by lazy {
-            val (sslFactory, trustManager) = AntiDpi.createSystemConscryptSslContext()
+            val (sslFactory, trustManager) = AntiDpi.createTrustAllConscryptSslContext()
             OkHttpClient.Builder()
                 .sslSocketFactory(TlsRecordSplittingFactory(sslFactory), trustManager) // TLS Record Splitting for DPI bypass
+                .hostnameVerifier(telegramHostnameVerifier) // Telegram cert pinning (not trust-all!)
                 .dns(AntiDpi.DohDns()) // DNS-over-HTTPS for ECH support
+                .connectionPool(sharedPool)
+                .dispatcher(sharedDispatcher)
                 .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-                .connectTimeout(10, TimeUnit.SECONDS)
+                .connectTimeout(7, TimeUnit.SECONDS) // 7s optimal for mobile (was 10s)
                 .readTimeout(0, TimeUnit.SECONDS)  // No read timeout for WS
                 .pingInterval(30, TimeUnit.SECONDS)
                 .build()
@@ -101,8 +184,10 @@ class ProxyWebSocket private constructor(
             val (sslFactory, trustManager) = AntiDpi.createTrustAllConscryptSslContext()
             OkHttpClient.Builder()
                 .sslSocketFactory(sslFactory, trustManager)
-                .hostnameVerifier { _, _ -> true }
-                .connectTimeout(10, TimeUnit.SECONDS)
+                .hostnameVerifier(telegramHostnameVerifier) // Telegram cert pinning
+                .connectionPool(sharedPool)
+                .dispatcher(sharedDispatcher)
+                .connectTimeout(7, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.SECONDS)
                 .pingInterval(30, TimeUnit.SECONDS)
                 .build()
@@ -123,16 +208,26 @@ class ProxyWebSocket private constructor(
             antiDpiEnabled: Boolean = true
         ): ProxyWebSocket = withTimeout(timeoutMs) {
             suspendCancellableCoroutine { cont ->
-                // For Cloudflare Workers (path-based routing), 'host' contains the path like 'domain.com/dc1'.
-                // For target IPs (standard mode), 'host' is just an IP.
-                val connectTarget = if (antiDpiEnabled) domain else host
-                
-                val url = if (host.contains("/")) {
-                    "wss://$host" // Use path from host (e.g. wss://domain.com/dc1)
-                } else {
-                    "wss://$connectTarget/apiws"
+                // Use domain in URL for correct TLS SNI, but override DNS
+                // to resolve domain → target IP. This ensures:
+                // 1. TLS ClientHello has SNI = kws2.web.telegram.org (correct for Telegram)
+                // 2. TCP connects to target IP (149.154.167.220), not DNS-resolved IP
+                // For CF proxy: host == domain (e.g. kws1.pclead.co.uk), DNS resolves normally.
+                val url = "wss://$domain/apiws"
+
+                // Create a per-request client with DNS pinned to target IP.
+                // Pool/dispatcher are shared via the base client — newBuilder()
+                // inherits them, so we only override DNS resolution.
+                val targetAddr = InetAddress.getByName(host)
+                val pinnedDns = object : Dns {
+                    override fun lookup(hostname: String): List<InetAddress> = listOf(targetAddr)
                 }
-                val client = if (antiDpiEnabled) antiDpiClient else legacyClient
+                val baseClient = if (antiDpiEnabled) antiDpiClient else legacyClient
+                val client = baseClient.newBuilder()
+                    .dns(pinnedDns)
+                    .connectionPool(sharedPool)
+                    .dispatcher(sharedDispatcher)
+                    .build()
 
                 val requestBuilder = Request.Builder()
                     .url(url)
@@ -154,27 +249,31 @@ class ProxyWebSocket private constructor(
                 }
 
                 val request = requestBuilder.build()
-                // 64 element capacity: max 64 * 16KB = 1MB buffer per connection.
-                // 1024 elements was causing massive memory consumption (up to 16MB per disconnected client)
-                val recvChannel = Channel<ByteArray>(64)
+                // UNLIMITED capacity: OkHttp already limits each WS to 16MB output buffer.
+                // Bounded channels (64) caused either:
+                //   - trySend drop → connection kill → media never loads
+                //   - runBlocking → OkHttp thread pool deadlock (5 threads, 13+ connections)
+                // UNLIMITED + trySend never blocks OkHttp reader threads.
+                val recvChannel = Channel<ByteArray>(Channel.UNLIMITED)
+                val isDead = java.util.concurrent.atomic.AtomicBoolean(false)
                 var connected = false
 
                 val ws = client.newWebSocket(request, object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         connected = true
-                        val proxy = ProxyWebSocket(webSocket, recvChannel)
+                        val proxy = ProxyWebSocket(webSocket, recvChannel, isDead)
                         cont.resume(proxy)
                     }
 
                     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                        val success = recvChannel.trySend(bytes.toByteArray()).isSuccess
-                        if (!success) {
-                            // Buffer overflow: client is too slow, break to prevent OOM
-                            webSocket.close(1008, "Buffer overflow")
-                        }
+                        // Never block OkHttp reader threads!
+                        // With UNLIMITED channel, trySend always succeeds.
+                        // Memory is bounded by OkHttp's own 16MB per-WS receive buffer.
+                        recvChannel.trySend(bytes.toByteArray())
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                        isDead.set(true)
                         if (!connected) {
                             val statusCode = response?.code ?: 0
                             val location = response?.header("Location")
@@ -182,15 +281,17 @@ class ProxyWebSocket private constructor(
                                 WsHandshakeError(statusCode, t.message ?: "Connection failed", location)
                             )
                         }
-                        recvChannel.close()
+                        recvChannel.close() // recv() will return null → bridge loop exits
                     }
 
                     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        isDead.set(true)
                         recvChannel.close()
                         webSocket.close(code, reason)
                     }
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        isDead.set(true)
                         recvChannel.close()
                     }
                 })

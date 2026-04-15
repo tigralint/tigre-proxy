@@ -19,7 +19,8 @@ import io.ktor.network.sockets.*
  * Architecture notes:
  * - Uses structured concurrency (coroutineScope) for automatic cleanup
  * - When either direction (up/down) terminates, the entire scope cancels both
- * - Zero-allocation re-encryption in the TCP fallback hot path (reused buffers)
+ * - Re-encryption is zero-allocation (in-place AES-CTR on pre-allocated buffers)
+ * - WS sends still allocate via copyOfRange (OkHttp requires exact-size arrays)
  */
 object Bridge {
     private const val TAG = "Bridge"
@@ -51,11 +52,13 @@ object Bridge {
         val startTime = System.currentTimeMillis()
 
         try {
+            Log.d(TAG, "[$label] $dcTag bridge starting")
             coroutineScope {
                 // TCP → WS (client to Telegram)
                 launch(Dispatchers.IO) {
                     try {
                         val buf = ByteArray(READ_BUF_SIZE)
+                        val targetBuf = ByteArray(READ_BUF_SIZE) // Pre-allocated — reused every iteration
                         while (isActive && !clientInput.isClosedForRead) {
                             val n = clientInput.readAvailable(buf)
                             if (n == -1) {
@@ -72,22 +75,21 @@ object Bridge {
                             stats.bytesUp.addAndGet(n.toLong())
                             upBytes += n
 
-                            // Anti-DPI: traffic shaping micro-delays during handshake
-                            if (trafficShaping) {
+                            // Anti-DPI: traffic shaping micro-delays during handshake.
+                            // SKIP for media — delays kill TCP slow-start and cripple download speed.
+                            if (trafficShaping && !isMedia) {
                                 val shapeDelay = AntiDpi.trafficShapingDelayMs(upPackets)
                                 if (shapeDelay > 0) delay(shapeDelay)
                             }
                             upPackets++
 
-                            // Re-encrypt: ONE ALLOCATION PER READ. client cipher → plaintext → telegram cipher
-                            // Since we need a precisely sized array for WebSocket.send(), we allocate
-                            // targetBuf(n), decrypt into it, then encrypt it in-place.
-                            val targetBuf = ByteArray(n)
+                            // Re-encrypt into pre-allocated buffer (zero-alloc cipher path)
+                            // client cipher → plaintext → telegram cipher, all in targetBuf
                             ctx.cltDec.update(buf, 0, n, targetBuf, 0)
                             ctx.tgEnc.update(targetBuf, 0, n, targetBuf, 0)
 
                             if (splitter != null) {
-                                val parts = splitter.split(targetBuf)
+                                val parts = splitter.split(targetBuf.copyOfRange(0, n))
                                 if (parts.isEmpty()) continue
                                 if (parts.size > 1) {
                                     ws.sendBatch(parts)
@@ -95,7 +97,9 @@ object Bridge {
                                     ws.send(parts[0])
                                 }
                             } else {
-                                ws.send(targetBuf)
+                                // sendDirect: single copy (ByteString.of) instead of
+                                // double copy (copyOfRange + toByteString)
+                                ws.sendDirect(targetBuf, 0, n)
                             }
                         }
                     } catch (_: kotlinx.coroutines.CancellationException) {
@@ -117,8 +121,9 @@ object Bridge {
                             downBytes += n
                             downPackets++
 
-                            // Anti-DPI: traffic shaping micro-delays during handshake
-                            if (trafficShaping) {
+                            // Anti-DPI: traffic shaping micro-delays during handshake.
+                            // SKIP for media — delays kill TCP slow-start and cripple download speed.
+                            if (trafficShaping && !isMedia) {
                                 val shapeDelay = AntiDpi.trafficShapingDelayMs(downPackets)
                                 if (shapeDelay > 0) delay(shapeDelay)
                             }
@@ -130,7 +135,13 @@ object Bridge {
                             ctx.cltEnc.update(data, 0, n, data, 0)
 
                             clientOutput.writeFully(data)
-                            clientOutput.flush()
+                            // Smart flush: only flush when WS recv channel is drained.
+                            // This batches all available WS frames into a single TCP write,
+                            // instead of syscall-per-frame (which killed throughput at 50KB/s).
+                            // When stream goes quiet, we flush to prevent stale data in buffer.
+                            if (ws.isRecvEmpty) {
+                                clientOutput.flush()
+                            }
                         }
                     } catch (_: kotlinx.coroutines.CancellationException) {
                         throw kotlinx.coroutines.CancellationException() // propagate to cancel peer
@@ -143,6 +154,8 @@ object Bridge {
             }
         } catch (_: kotlinx.coroutines.CancellationException) {
             // Normal: one direction finished, scope cancelled the other
+        } catch (e: Exception) {
+            Log.e(TAG, "[$label] $dcTag bridge FATAL: $e", e)
         }
 
         val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
@@ -191,7 +204,7 @@ object Bridge {
 
         try {
             val remoteInput = socket.openReadChannel()
-            val remoteOutput = socket.openWriteChannel(autoFlush = true)
+            val remoteOutput = socket.openWriteChannel(autoFlush = false)
 
             // Send relay init with Randomized TCP Fragmentation (DPI Bypass)
             // Break the handshake into random-sized fragments (3-7 chunks) with random delays
@@ -212,6 +225,7 @@ object Bridge {
                 } else {
                     remoteOutput.writeFully(relayInit)
                 }
+                remoteOutput.flush() // Handshake must complete immediately
             }
 
             // Bidirectional TCP ↔ TCP with re-encryption (structured concurrency)
@@ -237,6 +251,7 @@ object Bridge {
                                 ctx.cltDec.update(buf, 0, n, outBuf, 0)
                                 ctx.tgEnc.update(outBuf, 0, n, buf, 0)
                                 remoteOutput.writeFully(buf, 0, n)
+                                remoteOutput.flush()
                             }
                         } catch (_: kotlinx.coroutines.CancellationException) {
                             throw kotlinx.coroutines.CancellationException()
@@ -320,19 +335,16 @@ object Bridge {
         Log.i(TAG, "[$label] DC$dc$mediaTag → trying CF proxy (options: ${prioritizedList.size})")
 
         for (baseDomain in prioritizedList) {
-            // Using path-based routing (e.g., domain/dc2)
-            val connectTarget = if (baseDomain.contains("/")) {
-                if (baseDomain.endsWith("/")) "${baseDomain}dc$dc" else "$baseDomain/dc$dc"
-            } else {
-                "$baseDomain/dc$dc"
-            }
+            // Subdomain routing: kws{dc}.{baseDomain} — matches original Python impl
+            val domain = "kws$dc.$baseDomain"
 
             try {
-                ws = ProxyWebSocket.connect(connectTarget, baseDomain.split("/")[0], timeoutMs = 10000, antiDpiEnabled = config.antiDpiEnabled)
+                ws = ProxyWebSocket.connect(domain, domain, timeoutMs = 10000, antiDpiEnabled = config.antiDpiEnabled)
                 chosenDomain = baseDomain
+                Log.i(TAG, "[$label] DC$dc$mediaTag CF proxy connected via $domain")
                 break
             } catch (e: Exception) {
-                Log.w(TAG, "[$label] DC$dc$mediaTag CF proxy failed ($baseDomain): $e")
+                Log.w(TAG, "[$label] DC$dc$mediaTag CF proxy failed ($domain): ${e::class.simpleName}: ${e.message}")
             }
         }
 
@@ -375,6 +387,8 @@ object Bridge {
             methods.add(if (cfFirst) 0 else 1, "cf")
         }
 
+        Log.i(TAG, "[$label] DC$dc$mediaTag fallback: methods=${methods.joinToString("→")} tcp_ip=${fallbackDst ?: "none"} cf_enabled=$useCf cf_domains=${config.cfProxyDomains.size}")
+
         for (method in methods) {
             when (method) {
                 "cf" -> {
@@ -382,7 +396,11 @@ object Bridge {
                         clientInput, clientOutput, relayInit, label,
                         dc, isMedia, ctx, splitter, config, stats
                     )
-                    if (ok) return true
+                    if (ok) {
+                        Log.i(TAG, "[$label] DC$dc$mediaTag fallback via CF proxy succeeded")
+                        return true
+                    }
+                    Log.w(TAG, "[$label] DC$dc$mediaTag CF proxy fallback failed")
                 }
                 "tcp" -> {
                     if (fallbackDst != null) {
@@ -391,11 +409,18 @@ object Bridge {
                             clientInput, clientOutput, fallbackDst, 443,
                             relayInit, label, dc, isMedia, ctx, stats
                         )
-                        if (ok) return true
+                        if (ok) {
+                            Log.i(TAG, "[$label] DC$dc$mediaTag fallback via TCP succeeded")
+                            return true
+                        }
+                        Log.w(TAG, "[$label] DC$dc$mediaTag TCP fallback failed")
+                    } else {
+                        Log.w(TAG, "[$label] DC$dc$mediaTag no TCP fallback IP for DC$dc")
                     }
                 }
             }
         }
+        Log.w(TAG, "[$label] DC$dc$mediaTag ALL fallback methods exhausted!")
         return false
     }
 }

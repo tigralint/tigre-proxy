@@ -1,19 +1,14 @@
 package tigralint.tgproxy
 
 import android.Manifest
-import android.content.ComponentName
-import android.content.Context
-import android.content.Intent
-import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.*
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -27,58 +22,27 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import tigralint.tgproxy.proxy.ProxyConfig
-import tigralint.tgproxy.proxy.ProxyStats
-import tigralint.tgproxy.proxy.TcpServer
 import tigralint.tgproxy.service.ProxyForegroundService
+import tigralint.tgproxy.ui.ProxyViewModel
 import tigralint.tgproxy.ui.screens.DashboardScreen
 import tigralint.tgproxy.ui.screens.FaqScreen
 import tigralint.tgproxy.ui.screens.LogsScreen
 import tigralint.tgproxy.ui.screens.SettingsScreen
+import tigralint.tgproxy.util.AppLogger
 import tigralint.tgproxy.util.Texts
 import tigralint.tgproxy.ui.theme.*
 import tigralint.tgproxy.util.BatteryOptimization
-import tigralint.tgproxy.util.ConfigStorage
 
 class MainActivity : ComponentActivity() {
 
-    private val proxyServiceState = mutableStateOf<ProxyForegroundService?>(null)
-    private var proxyService: ProxyForegroundService?
-        get() = proxyServiceState.value
-        set(value) { proxyServiceState.value = value }
-    private var isBound = false
-
-    // State holders
-    private val proxyStatus = mutableStateOf(ProxyForegroundService.ProxyStatus.STOPPED)
-    private val proxyStats = mutableStateOf(ProxyStats.Snapshot())
-    private val proxyConfig = mutableStateOf(ProxyConfig()) // Will be loaded in onCreate
-    private val proxyLink = mutableStateOf("")
-    private val isBatteryOptimized = mutableStateOf(true)
-    private val hasAutoStart = mutableStateOf(false)
-
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            val service = (binder as ProxyForegroundService.ProxyBinder).getService()
-            proxyService = service
-            isBound = true
-
-            // Sync state
-            proxyConfig.value = service.config
-
-            // Observe service status
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            proxyService = null
-            isBound = false
-        }
-    }
+    private val viewModel by viewModels<ProxyViewModel>()
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -86,11 +50,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val prefs = getSharedPreferences("TgProxyPrefs", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences("TgProxyPrefs", MODE_PRIVATE)
         Texts.isRu = prefs.getBoolean("isRu", true)
-        
-        // Load persistent proxy config
-        proxyConfig.value = ConfigStorage.load(this)
         
         enableEdgeToEdge()
 
@@ -105,65 +66,34 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             TgProxyTheme {
-                MainApp()
+                MainApp(viewModel)
             }
         }
     }
 
     override fun onResume() {
         super.onResume()
-        isBatteryOptimized.value = BatteryOptimization.isBatteryOptimized(this)
-        hasAutoStart.value = BatteryOptimization.hasAutoStartSettings(this)
-        bindProxyService()
+        viewModel.refreshBatteryStatus()
+        viewModel.bindService()
+        AppLogger.flush() // Ensure logs UI is up to date
     }
 
     override fun onPause() {
         super.onPause()
-        unbindProxyService()
-    }
-
-    private fun bindProxyService() {
-        val intent = Intent(this, ProxyForegroundService::class.java)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
-    }
-
-    private fun unbindProxyService() {
-        if (isBound) {
-            unbindService(serviceConnection)
-            isBound = false
-        }
-    }
-
-    private fun toggleProxy() {
-        val service = proxyService ?: return
-        val status = service.status.value
-
-        if (status == ProxyForegroundService.ProxyStatus.RUNNING) {
-            val stopIntent = Intent(this, ProxyForegroundService::class.java).apply {
-                action = ProxyForegroundService.ACTION_STOP
-            }
-            startService(stopIntent)
-        } else {
-            service.updateConfig(proxyConfig.value)
-            val startIntent = Intent(this, ProxyForegroundService::class.java).apply {
-                action = ProxyForegroundService.ACTION_START
-            }
-            startForegroundService(startIntent)
-        }
+        viewModel.unbindService()
     }
 
     @Composable
-    private fun MainApp() {
+    private fun MainApp(vm: ProxyViewModel) {
         val navController = rememberNavController()
 
-        // Collect service state
-        val service = proxyService
-        val status by service?.status?.collectAsState() ?: remember { proxyStatus }
-        val statsSnapshot by service?.stats?.snapshot?.collectAsState()
-            ?: remember { mutableStateOf(ProxyStats.Snapshot()) }
-        val link = if (status == ProxyForegroundService.ProxyStatus.RUNNING) {
-            service?.getProxyLink() ?: ""
-        } else ""
+        // Collect ViewModel state (lifecycle-aware — no leaks)
+        val status by vm.status.collectAsStateWithLifecycle()
+        val statsSnapshot by vm.stats.collectAsStateWithLifecycle()
+        val config by vm.config.collectAsStateWithLifecycle()
+        val isBatteryOptimized by vm.isBatteryOptimized.collectAsStateWithLifecycle()
+        val hasAutoStart by vm.hasAutoStart.collectAsStateWithLifecycle()
+        val link by vm.proxyLink.collectAsStateWithLifecycle()
 
         Scaffold(
             bottomBar = {
@@ -222,29 +152,25 @@ class MainActivity : ComponentActivity() {
                         status = status,
                         stats = statsSnapshot,
                         proxyLink = link,
-                        onToggleProxy = ::toggleProxy,
-                        isBatteryOptimized = isBatteryOptimized.value,
+                        onToggleProxy = vm::toggleProxy,
+                        isBatteryOptimized = isBatteryOptimized,
                         onRequestBatteryOptimization = {
-                            BatteryOptimization.requestDisableBatteryOptimization(this@MainActivity)
+                            vm.requestDisableBatteryOptimization(this@MainActivity)
                         }
                     )
                 }
                 composable("settings") {
                     SettingsScreen(
-                        config = proxyConfig.value,
+                        config = config,
                         isRunning = status == ProxyForegroundService.ProxyStatus.RUNNING,
-                        onSave = { newConfig ->
-                            proxyConfig.value = newConfig
-                            ConfigStorage.save(this@MainActivity, newConfig)
-                            proxyService?.updateConfig(newConfig)
-                        },
+                        onSave = { newConfig -> vm.updateConfig(newConfig) },
                         onRequestBatteryOptimization = {
-                            BatteryOptimization.requestDisableBatteryOptimization(this@MainActivity)
+                            vm.requestDisableBatteryOptimization(this@MainActivity)
                         },
-                        isBatteryOptimized = isBatteryOptimized.value,
-                        hasAutoStart = hasAutoStart.value,
+                        isBatteryOptimized = isBatteryOptimized,
+                        hasAutoStart = hasAutoStart,
                         onRequestAutoStart = {
-                            BatteryOptimization.requestAutoStart(this@MainActivity)
+                            vm.requestAutoStart(this@MainActivity)
                         }
                     )
                 }

@@ -26,10 +26,11 @@ class AesCtrCipher(key: ByteArray, iv: ByteArray) {
         private val SKIP_BUF = ByteArray(256)
 
         /**
-         * Shared discard buffer for skip() output.
-         * The result of encrypting zeros is the raw keystream — we don't need it.
+         * Thread-local discard buffer for skip() output.
+         * Each thread gets its own buffer — eliminates data race if two
+         * skip() calls run on different coroutine dispatchers simultaneously.
          */
-        private val SKIP_OUT = ByteArray(256)
+        private val skipOutLocal = ThreadLocal.withInitial { ByteArray(256) }
     }
 
     /**
@@ -58,15 +59,15 @@ class AesCtrCipher(key: ByteArray, iv: ByteArray) {
     /**
      * Advance the cipher keystream by [n] zero bytes (fast-forward).
      *
-     * ZERO-ALLOCATION: Uses shared static buffers instead of creating
-     * throwaway ByteArrays. For typical skip(64) this means 0 GC pressure
-     * per connection handshake (was 4 allocations × 64 bytes before).
+     * ZERO-ALLOCATION: Uses shared static input buffer + thread-local output buffer.
+     * For typical skip(64) this means 0 GC pressure per connection handshake.
      */
     fun skip(n: Int) {
+        val skipOut = skipOutLocal.get()!!
         var remaining = n
         while (remaining > 0) {
             val chunk = minOf(remaining, SKIP_BUF.size)
-            cipher.update(SKIP_BUF, 0, chunk, SKIP_OUT, 0)
+            cipher.update(SKIP_BUF, 0, chunk, skipOut, 0)
             remaining -= chunk
         }
     }

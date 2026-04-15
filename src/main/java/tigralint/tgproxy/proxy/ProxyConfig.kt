@@ -13,16 +13,16 @@ data class ProxyConfig(
     var host: String = "127.0.0.1",
     var secret: String = generateSecret(),
     var dcRedirects: MutableMap<Int, String> = mutableMapOf(
-        1 to "149.154.175.50",
+        // Only DC2 and DC4 are served by the Telegram WS gateway.
+        // DC1/3/5 do NOT work via this gateway — they return 302 redirect loops.
+        // Traffic for DC1/3/5 automatically falls through to CF proxy or TCP fallback.
         2 to "149.154.167.220",
-        3 to "149.154.175.100",
-        4 to "91.108.4.218",
-        5 to "91.108.56.143"
+        4 to "149.154.167.220"
     ),
     var bufferSize: Int = 256 * 1024,
-    var poolSize: Int = 4,
+    var poolSize: Int = 8,  // 8 pre-connected WS per DC (4 was too low for media bursts)
     var fallbackCfProxy: Boolean = true,
-    var fallbackCfProxyPriority: Boolean = false,
+    var fallbackCfProxyPriority: Boolean = true,
     var cfProxyUserDomain: String = "",
     var cfProxyDomains: MutableList<String> = mutableListOf(),
     var activeCfProxyDomain: String = "",
@@ -33,6 +33,8 @@ data class ProxyConfig(
     var dohServer: String = "https://1.1.1.1/dns-query",
     var trafficShaping: Boolean = true,       // Micro-delays during handshake to blur timing
     var tlsRecordSplitting: Boolean = true,   // Split ClientHello TLS records to hide SNI from DPI
+    var wsPoolMaxAgeMs: Long = 120_000L,      // Max age for pooled WebSocket connections
+    var readBufferSize: Int = 65536,          // TCP read buffer size for Bridge
 
 ) {
     /** Initialize CF proxy domains on start. */

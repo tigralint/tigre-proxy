@@ -24,7 +24,38 @@ class TcpServer(
     companion object {
         private const val TAG = "TcpServer"
         private const val DC_FAIL_COOLDOWN_MS = 30_000L
-        private const val WS_FAIL_TIMEOUT_MS = 6000L
+        private const val WS_FAIL_TIMEOUT_MS = 2000L
+
+        /**
+         * WebSocket gateway IP — shared by all kws*.web.telegram.org domains.
+         * The raw DC IPs (149.154.175.50 etc.) do NOT support WebSocket!
+         * Telegram's WS gateway routes to the correct DC based on the domain name
+         * (kws1 → DC1, kws2 → DC2, etc.), not by IP.
+         */
+        private const val WS_GATEWAY_IP = "149.154.167.220"
+
+        /**
+         * Default DC-to-IP mappings for WS gateway.
+         * Only DC2 and DC4 are supported by the WS gateway 149.154.167.220.
+         * DC1/3/5 return 302 redirect loops and must fall through to CF proxy/TCP.
+         */
+        private val DEFAULT_DC_IPS = mapOf(
+            2 to WS_GATEWAY_IP,
+            4 to WS_GATEWAY_IP
+        )
+
+        /**
+         * Map CDN/special DCs to their parent DC.
+         *
+         * Telegram CDN scheme: DCxxx → DCx via modulo, EXCEPT DC203 which
+         * empirically routes to DC2 (not DC3). This was confirmed in previous
+         * sessions — DC203 is DC2's CDN media node for CIS users.
+         */
+        fun effectiveDc(dc: Int): Int = when {
+            dc == 203 -> 2   // DC203 = DC2 CDN media (empirically confirmed, NOT dc%100=3!)
+            dc > 100 -> dc % 100
+            else -> dc
+        }
     }
 
     private var serverSocket: ServerSocket? = null
@@ -117,9 +148,14 @@ class TcpServer(
         // Stats logging loop
         serverScope.launch {
             while (isActive) {
-                delay(60_000)
+                delay(30_000)
                 stats.publishSnapshot()
-                log("INFO", "stats: ${stats.summary()}")
+                val bl = wsBlacklist.joinToString(",") { it }.ifEmpty { "none" }
+                val cooldowns = dcFailUntil.entries
+                    .filter { it.value > System.currentTimeMillis() }
+                    .joinToString(",") { "${it.key}:${(it.value - System.currentTimeMillis()) / 1000}s" }
+                    .ifEmpty { "none" }
+                log("INFO", "stats: ${stats.summary()} | ws_bl=$bl | cooldowns=$cooldowns")
             }
         }
 
@@ -183,7 +219,7 @@ class TcpServer(
 
         try {
             val input = client.openReadChannel()
-            val output = client.openWriteChannel(autoFlush = true)
+            val output = client.openWriteChannel(autoFlush = false)
 
             val masking = config.fakeTlsDomain
 
@@ -296,40 +332,50 @@ class TcpServer(
 
             log("DEBUG", "[$label] handshake ok: DC$dc$mediaTag proto=0x%08X".format(protoInt))
 
-            // Force Padded Intermediate for relay to Telegram.
-            // Padded Intermediate adds random padding to every MTProto frame,
-            // making packet sizes variable and harder for DPI to fingerprint.
-            // The client-side protocol stays unchanged (proxy translates via re-encryption).
-            val relayProtoTag = Constants.PROTO_TAG_SECURE // 0xDDDDDDDD = Padded Intermediate
+            // Relay proto must match client's proto — we re-encrypt bytes without translating framing.
+            // If the client speaks Intermediate, the relay must also speak Intermediate.
+            val relayProtoTag = protoTag
 
-            // Generate relay init with padded intermediate protocol
+            // Generate relay init with the client's protocol
             val relayInit = MtProtoHandshake.generateRelayInit(relayProtoTag, dcIdx)
 
             // Setup 4 cipher contexts
             val ctx = setupCryptoCtx(clientDecPrekeyIv, secret, relayInit)
 
-            val dcKey = "$dc${if (isMedia) "m" else ""}"
-            val splitter = try { MsgSplitter(relayInit, protoInt) } catch (_: Exception) { null }
+            // Resolve effective DC for routing (DC203 → DC2, etc.)
+            val effectDc = effectiveDc(dc)
+            val dcKey = "$effectDc${if (isMedia) "m" else ""}"
 
-            // Try CF Priority if enabled
-            if (config.fallbackCfProxy && config.fallbackCfProxyPriority) {
-                log("INFO", "[$label] DC$dc$mediaTag (CF Priority) → trying fallback first")
-                if (Bridge.doFallback(clientInput, clientOutput, relayInit, label, dc, isMedia, ctx, splitter, config, stats)) return
+            // === DC ROUTING DECISION ===
+            // Only DC2 and DC4 have working WS gateways. DC1/3/5 go straight to fallback.
+            var targetIp: String? = config.dcRedirects[effectDc]
+            var routingSource = "config"
+
+            if (targetIp == null && effectDc in DEFAULT_DC_IPS) {
+                targetIp = DEFAULT_DC_IPS[effectDc]
+                config.dcRedirects[effectDc] = targetIp!!
+                routingSource = "default"
+                log("INFO", "[$label] DC$dc auto-mapped to DC$effectDc ($targetIp) [source=$routingSource]")
             }
 
-            // Fallback if DC not mapped or blacklisted
-            if (dc !in config.dcRedirects || dcKey in wsBlacklist) {
-                if (dc !in config.dcRedirects) {
-                    log("INFO", "[$label] DC$dc not in config → fallback")
+            // Note: CF proxy priority is handled inside Bridge.doFallback() —
+            // it controls order of fallback methods (CF first vs TCP first),
+            // NOT whether to skip WS gateway attempts.
+
+            // Fallback if DC has no WS gateway or is blacklisted
+            if (targetIp == null || dcKey in wsBlacklist) {
+                if (targetIp == null) {
+                    log("INFO", "[$label] DC$dc$mediaTag no WS gateway → fallback")
                 } else {
                     log("INFO", "[$label] DC$dc$mediaTag WS blacklisted → fallback")
                 }
+                val fbSplitter = try { MsgSplitter(relayInit, protoInt) } catch (_: Exception) { null }
                 val ok = Bridge.doFallback(
                     clientInput, clientOutput, relayInit, label,
-                    dc, isMedia, ctx, splitter, config, stats
+                    dc, isMedia, ctx, fbSplitter, config, stats
                 )
                 if (!ok) {
-                    log("WARN", "[$label] DC$dc$mediaTag no fallback available")
+                    log("WARN", "[$label] DC$dc$mediaTag no fallback available!")
                 }
                 return
             }
@@ -339,38 +385,43 @@ class TcpServer(
             val failUntil = dcFailUntil[dcKey] ?: 0
             val wsTimeout = if (now < failUntil) WS_FAIL_TIMEOUT_MS else 10_000L
 
-            val domains = WsPool.wsDomains(dc, isMedia)
-            val target = config.dcRedirects[dc]!!
+            val domains = WsPool.wsDomains(effectDc, isMedia)
+            val target = targetIp!!
             var ws: ProxyWebSocket? = null
             var wsFailedRedirect = false
             var allRedirects = true
+
+            log("DEBUG", "[$label] DC$dc$mediaTag routing: target=$target source=$routingSource timeout=${wsTimeout}ms")
 
             // Try pool first
             ws = pool.get(dc, isMedia, target, domains)
             if (ws != null) {
                 log("INFO", "[$label] DC$dc$mediaTag → pool hit via $target")
             } else {
-                // Direct connect
-                for (domain in domains) {
-                    log("INFO", "[$label] DC$dc$mediaTag → wss://$domain/apiws via $target")
+                for ((idx, domain) in domains.withIndex()) {
+                    val connStart = System.currentTimeMillis()
+                    log("INFO", "[$label] DC$dc$mediaTag → wss://$domain/apiws via $target [${idx+1}/${domains.size}]")
                     try {
                         ws = ProxyWebSocket.connect(target, domain, timeoutMs = wsTimeout, antiDpiEnabled = config.antiDpiEnabled)
+                        val connTime = System.currentTimeMillis() - connStart
+                        log("INFO", "[$label] DC$dc$mediaTag WS connected in ${connTime}ms")
                         allRedirects = false
                         break
                     } catch (e: WsHandshakeError) {
+                        val connTime = System.currentTimeMillis() - connStart
                         stats.wsErrors.incrementAndGet()
                         if (e.isRedirect) {
                             wsFailedRedirect = true
-                            log("WARN", "[$label] DC$dc$mediaTag got ${e.statusCode} from $domain → ${e.location ?: "?"}")
-                            continue
+                            log("WARN", "[$label] DC$dc$mediaTag ${e.statusCode} from $domain (${connTime}ms)")
                         } else {
                             allRedirects = false
-                            log("WARN", "[$label] DC$dc$mediaTag WS handshake: ${e.statusLine}")
+                            log("WARN", "[$label] DC$dc$mediaTag WS error: ${e.statusLine} (${connTime}ms)")
                         }
                     } catch (e: Exception) {
+                        val connTime = System.currentTimeMillis() - connStart
                         stats.wsErrors.incrementAndGet()
                         allRedirects = false
-                        log("WARN", "[$label] DC$dc$mediaTag WS connect failed: $e")
+                        log("WARN", "[$label] DC$dc$mediaTag WS failed: ${e::class.simpleName} (${connTime}ms)")
                     }
                 }
             }
@@ -383,17 +434,17 @@ class TcpServer(
                 } else {
                     dcFailUntil[dcKey] = now + DC_FAIL_COOLDOWN_MS
                     if (!wsFailedRedirect) {
-                        log("INFO", "[$label] DC$dc$mediaTag WS cooldown for ${DC_FAIL_COOLDOWN_MS / 1000}s")
+                        log("INFO", "[$label] DC$dc$mediaTag WS cooldown ${DC_FAIL_COOLDOWN_MS / 1000}s")
                     }
                 }
 
-                val splitterFb = try { MsgSplitter(relayInit, protoInt) } catch (_: Exception) { null }
+                val fbSplitter = try { MsgSplitter(relayInit, protoInt) } catch (_: Exception) { null }
                 val ok = Bridge.doFallback(
                     clientInput, clientOutput, relayInit, label,
-                    dc, isMedia, ctx, splitterFb, config, stats
+                    dc, isMedia, ctx, fbSplitter, config, stats
                 )
-                if (ok) {
-                    log("INFO", "[$label] DC$dc$mediaTag fallback closed")
+                if (!ok) {
+                    log("WARN", "[$label] DC$dc$mediaTag no fallback available!")
                 }
                 return
             }
@@ -408,7 +459,15 @@ class TcpServer(
             } catch (_: Exception) { null }
 
             // Send relay init to Telegram via WS
-            ws.send(relayInit)
+            log("DEBUG", "[$label] sending relay_init (${relayInit.size}B) to WS...")
+            try {
+                ws.send(relayInit)
+            } catch (e: Exception) {
+                log("ERROR", "[$label] relay_init send FAILED: $e")
+                ws.close()
+                return
+            }
+            log("DEBUG", "[$label] relay_init sent, starting bridge...")
 
             // Start the bidirectional bridge
             Bridge.bridgeWsReencrypt(
@@ -514,7 +573,7 @@ class TcpServer(
 
         try {
             val upInput = upstream.openReadChannel()
-            val upOutput = upstream.openWriteChannel(autoFlush = true)
+            val upOutput = upstream.openWriteChannel(autoFlush = false)
 
             // Send initial data
             if (initialData.isNotEmpty()) {

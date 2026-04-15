@@ -85,7 +85,7 @@ fun LogsScreen(modifier: Modifier = Modifier) {
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(logs) { log ->
+                items(logs, key = { it.hashCode() }) { log ->
                     LogItem(log)
                 }
                 
@@ -95,6 +95,13 @@ fun LogsScreen(modifier: Modifier = Modifier) {
                             Text("No logs", color = TextSecondary)
                         }
                     }
+                }
+            }
+
+            // Auto-scroll to top when new logs arrive
+            LaunchedEffect(logs.size) {
+                if (logs.isNotEmpty()) {
+                    listState.animateScrollToItem(0)
                 }
             }
         }

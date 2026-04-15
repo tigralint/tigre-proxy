@@ -69,7 +69,10 @@ object ConfigStorage {
                 }
             }
             if (map.isNotEmpty()) {
-                config.dcRedirects = map
+                // Merge: user-saved DCs override defaults, but keep defaults for unsaved DCs
+                val merged = config.dcRedirects.toMutableMap()
+                merged.putAll(map)
+                config.dcRedirects = merged
             }
         }
         
@@ -79,6 +82,31 @@ object ConfigStorage {
         config.trafficShaping = prefs.getBoolean(KEY_TRAFFIC_SHAPING, true)
         config.tlsRecordSplitting = prefs.getBoolean(KEY_TLS_RECORD_SPLITTING, true)
         
+        // Migration: Replace raw DC IPs (which don't support WebSocket) with WS gateway
+        // IMPORTANT: Only DC2 and DC4 are supported by the WS gateway.
+        // DC1/3/5 cause redirect loops and must be removed.
+        val WS_GATEWAY = "149.154.167.220"
+        val RAW_DC_IPS = setOf(
+            "149.154.175.50", "149.154.167.50", "149.154.175.100",
+            "149.154.167.91", "91.108.4.218", "91.108.56.100", "91.108.56.143"
+        )
+        for ((dc, ip) in config.dcRedirects.toMap()) {
+            if (ip in RAW_DC_IPS) {
+                if (dc == 2 || dc == 4) {
+                    config.dcRedirects[dc] = WS_GATEWAY
+                } else {
+                    // DC1/3/5 can't use WS gateway — remove to trigger fallback
+                    config.dcRedirects.remove(dc)
+                }
+            }
+        }
+        // Also remove DC1/3/5 if they point to WS gateway (left over from old builds)
+        for (dc in listOf(1, 3, 5)) {
+            if (config.dcRedirects[dc] == WS_GATEWAY) {
+                config.dcRedirects.remove(dc)
+            }
+        }
+
         return config
     }
 }

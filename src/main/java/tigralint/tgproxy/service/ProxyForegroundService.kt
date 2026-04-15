@@ -32,9 +32,16 @@ class ProxyForegroundService : Service() {
         const val ACTION_START = "tigralint.tgproxy.START"
         const val ACTION_STOP = "tigralint.tgproxy.STOP"
         private const val NOTIFICATION_ID = 1
+        private const val WAKELOCK_TIMEOUT_MS = 4L * 60 * 60 * 1000 // 4 hours
 
-        var isRunning = false
-            private set
+        /**
+         * Shared status observable — readable from TileService and other components
+         * without needing a service binding. Replaces the old `var isRunning` boolean.
+         */
+        private val _sharedStatus = kotlinx.coroutines.flow.MutableStateFlow(ProxyStatus.STOPPED)
+        val sharedStatus: kotlinx.coroutines.flow.StateFlow<ProxyStatus> = _sharedStatus
+
+        val isRunning: Boolean get() = _sharedStatus.value == ProxyStatus.RUNNING
 
         fun requestTileUpdate(context: android.content.Context) {
             try {
@@ -108,7 +115,7 @@ class ProxyForegroundService : Service() {
         serverJob = serviceScope?.launch {
             try {
                 _status.value = ProxyStatus.RUNNING
-                isRunning = true
+                _sharedStatus.value = ProxyStatus.RUNNING
                 requestTileUpdate(this@ProxyForegroundService)
                 updateNotification("Listening on ${config.host}:${config.port}")
                 server.start()
@@ -130,7 +137,7 @@ class ProxyForegroundService : Service() {
         tcpServer?.stop()
         tcpServer = null
         _status.value = ProxyStatus.STOPPED
-        isRunning = false
+        _sharedStatus.value = ProxyStatus.STOPPED
         requestTileUpdate(this)
         releaseWakeLock()
         updateNotification("Proxy stopped")
@@ -201,12 +208,14 @@ class ProxyForegroundService : Service() {
     /**
      * Acquire WakeLock and WifiLock to keep the proxy running in background.
      *
-     * FIXED: No hardcoded timeout — lock is held until explicitly released.
-     * Release is guaranteed by stopProxy(), onDestroy(), and onTaskRemoved().
+     * Safety timeout: WakeLock auto-releases after 4 hours in case
+     * onDestroy()/stopProxy() is never called (e.g. system kills process).
+     * Under normal operation, explicit release happens in stopProxy().
      *
      * Uses WIFI_MODE_FULL_LOW_LATENCY on Android 12+ for optimal
      * WiFi performance with low-latency proxy traffic.
      */
+
     private fun acquireWakeLock() {
         val pm = getSystemService(PowerManager::class.java)
         wakeLock = pm.newWakeLock(
@@ -214,7 +223,7 @@ class ProxyForegroundService : Service() {
             "TgProxy::ProxyWakeLock"
         ).apply {
             setReferenceCounted(false)
-            acquire()
+            acquire(WAKELOCK_TIMEOUT_MS)
         }
         
         val wm = getSystemService(android.net.wifi.WifiManager::class.java)
@@ -229,7 +238,7 @@ class ProxyForegroundService : Service() {
             "TgProxy::ProxyWifiLock"
         )?.apply {
             setReferenceCounted(false)
-            acquire()
+            acquire() // WifiLock has no timeout API (unlike WakeLock); released in releaseWakeLock()
         }
     }
 

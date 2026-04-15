@@ -327,7 +327,7 @@ object AntiDpi {
 
     /**
      * Create an SSLSocketFactory using Conscrypt with system trust validation.
-     * Prevents MITM attacks when connecting to Cloudflare Workers or GitHub.
+     * Prevents MITM attacks when connecting to CF proxy domains or GitHub.
      */
     fun createSystemConscryptSslContext(): Pair<javax.net.ssl.SSLSocketFactory, X509TrustManager> {
         val factory = javax.net.ssl.TrustManagerFactory.getInstance(

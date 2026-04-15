@@ -2,6 +2,8 @@ package tigralint.tgproxy.proxy
 
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.ConcurrentHashMap
 import java.util.ArrayDeque
 
@@ -16,18 +18,29 @@ class WsPool(
 ) {
     companion object {
         private const val TAG = "WsPool"
-        private const val WS_POOL_MAX_AGE_MS = 120_000L
 
         /**
          * Get WebSocket domain names for a given DC.
          * Port of _ws_domains from tg_ws_proxy.py.
+         *
+         * For media: kws{dc}-1 first (dedicated media endpoint).
+         * For non-media: kws{dc} first (primary API endpoint).
+         * This matches the original Python implementation exactly.
          */
         fun wsDomains(dc: Int, isMedia: Boolean?): List<String> {
             val effectiveDc = if (dc == 203) 2 else dc
             return if (isMedia == null || isMedia) {
-                listOf("kws${effectiveDc}-1.web.telegram.org", "kws${effectiveDc}.web.telegram.org")
+                // Media prefers -1 variant first
+                listOf(
+                    "kws${effectiveDc}-1.web.telegram.org",
+                    "kws${effectiveDc}.web.telegram.org"
+                )
             } else {
-                listOf("kws${effectiveDc}.web.telegram.org", "kws${effectiveDc}-1.web.telegram.org")
+                // Non-media prefers main domain first
+                listOf(
+                    "kws${effectiveDc}.web.telegram.org",
+                    "kws${effectiveDc}-1.web.telegram.org"
+                )
             }
         }
     }
@@ -37,6 +50,13 @@ class WsPool(
 
     private val idle = ConcurrentHashMap<PoolKey, ArrayDeque<PoolEntry>>()
     private val refilling = ConcurrentHashMap.newKeySet<PoolKey>()
+
+    /**
+     * Limits concurrent TLS handshakes during pool refill.
+     * On mobile, 8 parallel handshakes cause CPU spikes and timeout cascades.
+     * 3 concurrent handshakes balances fill speed with CPU/bandwidth pressure.
+     */
+    private val connectSemaphore = Semaphore(3)
 
     /**
      * Get a WebSocket connection from the pool, or null if none available.
@@ -50,7 +70,7 @@ class WsPool(
             while (bucket.isNotEmpty()) {
                 val entry = bucket.poll() ?: break
                 val age = now - entry.createdAt
-                if (age > WS_POOL_MAX_AGE_MS || entry.ws.isClosed) {
+                if (age > config.wsPoolMaxAgeMs || entry.ws.isClosed) {
                     scope.launch { entry.ws.close() }
                     continue
                 }
@@ -83,7 +103,9 @@ class WsPool(
         if (needed <= 0) return
 
         val results = (0 until needed).map {
-            scope.async(Dispatchers.IO) { connectOne(targetIp, domains) }
+            scope.async(Dispatchers.IO) {
+                connectSemaphore.withPermit { connectOne(targetIp, domains) }
+            }
         }
 
         for (deferred in results) {
@@ -100,15 +122,19 @@ class WsPool(
         Log.d(TAG, "WS pool refilled DC${key.dc}${if (key.isMedia) "m" else ""}: ${synchronized(bucket) { bucket.size }} ready")
     }
 
+    /**
+     * Try ALL domains before giving up.
+     * Previously returned null on first non-redirect error, wasting the fallback domain.
+     */
     private suspend fun connectOne(targetIp: String, domains: List<String>): ProxyWebSocket? {
         for (domain in domains) {
             try {
                 return ProxyWebSocket.connect(targetIp, domain, timeoutMs = 8000, antiDpiEnabled = config.antiDpiEnabled)
             } catch (e: WsHandshakeError) {
                 if (e.isRedirect) continue
-                return null
+                continue // try next domain instead of giving up
             } catch (_: Exception) {
-                return null
+                continue // try next domain
             }
         }
         return null
