@@ -32,6 +32,7 @@ data class ProxyConfig(
     var dohEnabled: Boolean = true,           // DNS-over-HTTPS for ECH support
     var dohServer: String = "https://1.1.1.1/dns-query",
     var trafficShaping: Boolean = true,       // Micro-delays during handshake to blur timing
+    var tlsRecordSplitting: Boolean = true,   // Split ClientHello TLS records to hide SNI from DPI
 
 ) {
     /** Initialize CF proxy domains on start. */

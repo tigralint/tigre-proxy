@@ -1,20 +1,24 @@
 package tigralint.tgproxy.proxy
 
-import java.io.InputStream
-import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.SecureRandom
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import io.ktor.utils.io.*
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 
 /**
  * FakeTLS masking for DPI evasion.
  * Full port of fake_tls.py — ClientHello verification, ServerHello construction,
  * and TLS record wrapping.
+ *
+ * Performance notes:
+ * - wrapTlsRecord() now writes directly into a pre-sized ByteArray (zero intermediate copies)
+ * - unwrapFakeTls/wrapFakeTls use structured concurrency (no GlobalScope leaks)
+ * - Hot-path wrap writes TLS headers directly into ByteWriteChannel (zero-alloc steady state)
  */
 object FakeTls {
 
@@ -28,6 +32,9 @@ object FakeTls {
     private const val SESSION_ID_LEN = 32
     private const val TIMESTAMP_TOLERANCE = 120
     const val TLS_APPDATA_MAX = 16384
+
+    /** Pre-allocated 5-byte TLS record header template [0x17, 0x03, 0x03, 0x00, 0x00] */
+    private val TLS_APPDATA_HEADER = byteArrayOf(0x17, 0x03, 0x03, 0x00, 0x00)
 
     data class ClientHelloResult(
         val clientRandom: ByteArray,
@@ -135,8 +142,14 @@ object FakeTls {
             .putShort(encryptedSize.toShort())
             .array()
 
-        // Assemble: SH + CCS + AppData
-        val response = sh + CCS_FRAME + appRecordHeader + encryptedData
+        // Assemble: SH + CCS + AppData — single allocation
+        val totalSize = sh.size + CCS_FRAME.size + appRecordHeader.size + encryptedData.size
+        val response = ByteArray(totalSize)
+        var offset = 0
+        System.arraycopy(sh, 0, response, offset, sh.size); offset += sh.size
+        System.arraycopy(CCS_FRAME, 0, response, offset, CCS_FRAME.size); offset += CCS_FRAME.size
+        System.arraycopy(appRecordHeader, 0, response, offset, appRecordHeader.size); offset += appRecordHeader.size
+        System.arraycopy(encryptedData, 0, response, offset, encryptedData.size)
 
         // Compute HMAC of (client_random + response)
         val mac = Mac.getInstance("HmacSHA256")
@@ -145,51 +158,72 @@ object FakeTls {
         val serverRandom = mac.doFinal(response)
 
         // Place computed server_random
-        val final = response.copyOf()
-        System.arraycopy(serverRandom, 0, final, SH_RANDOM_OFF, 32)
+        System.arraycopy(serverRandom, 0, response, SH_RANDOM_OFF, 32)
 
-        return final
+        return response
     }
 
     /**
      * Wrap arbitrary data into TLS Application Data records (type 0x17).
      * Splits into chunks of max 16384 bytes.
+     *
+     * OPTIMIZED: Single pre-calculated allocation instead of O(N²) fold.
      */
     fun wrapTlsRecord(data: ByteArray): ByteArray {
-        val parts = mutableListOf<ByteArray>()
-        var offset = 0
-        while (offset < data.size) {
-            val chunkLen = minOf(TLS_APPDATA_MAX, data.size - offset)
-            val header = ByteBuffer.allocate(5)
-                .put(0x17.toByte())
-                .put(0x03.toByte())
-                .put(0x03.toByte())
-                .putShort(chunkLen.toShort())
-                .array()
-            parts.add(header + data.copyOfRange(offset, offset + chunkLen))
-            offset += chunkLen
+        if (data.isEmpty()) return ByteArray(0)
+
+        // Calculate exact total size upfront
+        val numFullChunks = data.size / TLS_APPDATA_MAX
+        val lastChunkSize = data.size % TLS_APPDATA_MAX
+        val numChunks = numFullChunks + if (lastChunkSize > 0) 1 else 0
+        val totalSize = numChunks * 5 + data.size // 5 bytes header per chunk + all data
+
+        val result = ByteArray(totalSize)
+        var srcOffset = 0
+        var dstOffset = 0
+
+        while (srcOffset < data.size) {
+            val chunkLen = minOf(TLS_APPDATA_MAX, data.size - srcOffset)
+
+            // Write TLS record header directly
+            result[dstOffset] = 0x17
+            result[dstOffset + 1] = 0x03
+            result[dstOffset + 2] = 0x03
+            result[dstOffset + 3] = (chunkLen shr 8).toByte()
+            result[dstOffset + 4] = (chunkLen and 0xFF).toByte()
+            dstOffset += 5
+
+            // Copy payload
+            System.arraycopy(data, srcOffset, result, dstOffset, chunkLen)
+            dstOffset += chunkLen
+            srcOffset += chunkLen
         }
-        return parts.fold(ByteArray(0)) { acc, arr -> acc + arr }
+
+        return result
     }
 
     /**
      * Creates an async Ktor pipe that unwraps TLS Application Data records
      * from the raw [source] and pushes the plaintext MTProto data to the returned channel.
+     *
+     * FIXED: Uses structured concurrency via [scope] parameter instead of GlobalScope.
      */
-    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
-    fun unwrapFakeTls(source: ByteReadChannel): ByteReadChannel {
-        return kotlinx.coroutines.GlobalScope.writer(kotlinx.coroutines.Dispatchers.IO, autoFlush = true) {
+    fun unwrapFakeTls(source: ByteReadChannel, scope: CoroutineScope): ByteReadChannel {
+        return scope.writer(Dispatchers.IO, autoFlush = true) {
             val dest = channel
+            // Reusable header buffer — zero allocation in the loop
+            val hdr = ByteArray(5)
+            // Reusable copy buffer — zero allocation in the loop
+            val copyBuf = ByteArray(TLS_APPDATA_MAX)
             try {
-                while (!source.isClosedForRead) {
-                    val hdr = ByteArray(5)
+                while (isActive && !source.isClosedForRead) {
                     try {
                         source.readFully(hdr)
                     } catch (e: Exception) {
                         break // EOF or closed
                     }
                     val rtype = hdr[0]
-                    val recLen = ByteBuffer.wrap(hdr, 3, 2).short.toInt() and 0xFFFF
+                    val recLen = ((hdr[3].toInt() and 0xFF) shl 8) or (hdr[4].toInt() and 0xFF)
 
                     if (rtype == TLS_RECORD_CCS) {
                         source.discardExact(recLen.toLong())
@@ -200,11 +234,10 @@ object FakeTls {
                         break
                     }
 
-                    // Copy EXACTLY recLen bytes from source to dest
-                    var left = recLen.toLong()
-                    val copyBuf = ByteArray(8192)
+                    // Copy EXACTLY recLen bytes from source to dest using shared buffer
+                    var left = recLen
                     while (left > 0 && !source.isClosedForRead) {
-                        val toRead = minOf(left.toInt(), copyBuf.size)
+                        val toRead = minOf(left, copyBuf.size)
                         val n = source.readAvailable(copyBuf, 0, toRead)
                         if (n == -1) break
                         dest.writeFully(copyBuf, 0, n)
@@ -219,22 +252,72 @@ object FakeTls {
     /**
      * Creates an async Ktor pipe that wraps any raw MTProto data written to the
      * returned channel into FakeTLS Application Data records and writes them to [destination].
+     *
+     * FIXED: Uses structured concurrency via [scope] parameter instead of GlobalScope.
+     * OPTIMIZED: Writes TLS headers directly into ByteWriteChannel — TRUE zero-allocation
+     *            in the steady-state loop (no intermediate ByteArray copies).
      */
-    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
-    fun wrapFakeTls(destination: ByteWriteChannel): ByteWriteChannel {
-        return kotlinx.coroutines.GlobalScope.reader(kotlinx.coroutines.Dispatchers.IO) {
+    fun wrapFakeTls(destination: ByteWriteChannel, scope: CoroutineScope): ByteWriteChannel {
+        return scope.reader(Dispatchers.IO) {
             val source = channel
+            // Pre-allocated read buffer — reused every iteration
+            val buf = ByteArray(TLS_APPDATA_MAX)
+            // Pre-allocated 5-byte TLS header — reused every iteration
+            val hdr = ByteArray(5)
+            hdr[0] = 0x17
+            hdr[1] = 0x03
+            hdr[2] = 0x03
+
+            // TCP Slow Start simulation: first records use progressively larger sizes
+            // to mimic Chrome's congestion window growth pattern.
+            // This prevents DPI from detecting constant 16KB records as proxy traffic.
+            val SLOW_START_SIZES = intArrayOf(517, 1024, 2048, 4096, 8192)
+            var recordIndex = 0
+
             try {
-                val buf = ByteArray(16384)
-                while (!source.isClosedForRead) {
-                    val n = source.readAvailable(buf)
+                while (isActive && !source.isClosedForRead) {
+                    // Limit read size based on slow-start phase
+                    val maxRead = if (recordIndex < SLOW_START_SIZES.size) {
+                        SLOW_START_SIZES[recordIndex]
+                    } else {
+                        TLS_APPDATA_MAX
+                    }
+                    val n = source.readAvailable(buf, 0, maxRead)
                     if (n == -1) break
-                    val tlsRec = wrapTlsRecord(buf.copyOfRange(0, n))
-                    destination.writeFully(tlsRec)
+
+                    // Write TLS record header directly (zero-alloc)
+                    hdr[3] = (n shr 8).toByte()
+                    hdr[4] = (n and 0xFF).toByte()
+                    destination.writeFully(hdr)
+
+                    // Write payload directly from our reused buffer (zero-alloc)
+                    destination.writeFully(buf, 0, n)
                     destination.flush()
+                    recordIndex++
                 }
             } catch (_: kotlinx.coroutines.CancellationException) {
             } catch (_: Exception) {}
         }.channel
+    }
+
+    // ===== Legacy unwrap/wrap (old API without scope — DEPRECATED) =====
+    // Kept temporarily for backward compatibility. Callers should migrate to scoped versions.
+
+    /**
+     * @deprecated Use unwrapFakeTls(source, scope) instead for structured concurrency.
+     */
+    @Deprecated("Use unwrapFakeTls(source, scope) for structured concurrency", ReplaceWith("unwrapFakeTls(source, scope)"))
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+    fun unwrapFakeTls(source: ByteReadChannel): ByteReadChannel {
+        return unwrapFakeTls(source, kotlinx.coroutines.GlobalScope)
+    }
+
+    /**
+     * @deprecated Use wrapFakeTls(destination, scope) instead for structured concurrency.
+     */
+    @Deprecated("Use wrapFakeTls(destination, scope) for structured concurrency", ReplaceWith("wrapFakeTls(destination, scope)"))
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+    fun wrapFakeTls(destination: ByteWriteChannel): ByteWriteChannel {
+        return wrapFakeTls(destination, kotlinx.coroutines.GlobalScope)
     }
 }

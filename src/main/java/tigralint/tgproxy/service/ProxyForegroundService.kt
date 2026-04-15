@@ -141,7 +141,17 @@ class ProxyForegroundService : Service() {
     override fun onDestroy() {
         stopProxy()
         serviceScope?.cancel()
+        serviceScope = null
         super.onDestroy()
+    }
+
+    /**
+     * Called when the user swipes the app away from recents.
+     * Ensures WakeLock is always released even if the system kills us.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        releaseWakeLock()
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun buildNotification(text: String): Notification {
@@ -188,18 +198,34 @@ class ProxyForegroundService : Service() {
         } catch (_: Exception) {}
     }
 
+    /**
+     * Acquire WakeLock and WifiLock to keep the proxy running in background.
+     *
+     * FIXED: No hardcoded timeout — lock is held until explicitly released.
+     * Release is guaranteed by stopProxy(), onDestroy(), and onTaskRemoved().
+     *
+     * Uses WIFI_MODE_FULL_LOW_LATENCY on Android 12+ for optimal
+     * WiFi performance with low-latency proxy traffic.
+     */
     private fun acquireWakeLock() {
         val pm = getSystemService(PowerManager::class.java)
         wakeLock = pm.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "TgProxy::ProxyWakeLock"
         ).apply {
-            acquire(10 * 60 * 60 * 1000L) // 10 hours max
+            setReferenceCounted(false)
+            acquire()
         }
         
         val wm = getSystemService(android.net.wifi.WifiManager::class.java)
+        @Suppress("DEPRECATION")
+        val wifiMode = if (android.os.Build.VERSION.SDK_INT >= 31) {
+            android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
         wifiLock = wm?.createWifiLock(
-            android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+            wifiMode,
             "TgProxy::ProxyWifiLock"
         )?.apply {
             setReferenceCounted(false)

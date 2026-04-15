@@ -14,6 +14,24 @@ class AesCtrCipher(key: ByteArray, iv: ByteArray) {
         init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
     }
 
+    companion object {
+        /**
+         * Shared zero buffer for skip() operations.
+         * Since AES-CTR XORs input with keystream, feeding zeros just produces the
+         * keystream itself — which we discard. The input buffer is never mutated,
+         * so sharing it across all cipher instances is thread-safe.
+         *
+         * 256 bytes covers any realistic skip (typically 64 bytes).
+         */
+        private val SKIP_BUF = ByteArray(256)
+
+        /**
+         * Shared discard buffer for skip() output.
+         * The result of encrypting zeros is the raw keystream — we don't need it.
+         */
+        private val SKIP_OUT = ByteArray(256)
+    }
+
     /**
      * Process data through the cipher stream. In CTR mode this is the same
      * operation for both encryption and decryption.
@@ -37,9 +55,20 @@ class AesCtrCipher(key: ByteArray, iv: ByteArray) {
         return cipher.update(input, inOff, len, output, outOff)
     }
 
-    /** Advance the cipher keystream by [n] zero bytes (fast-forward). */
+    /**
+     * Advance the cipher keystream by [n] zero bytes (fast-forward).
+     *
+     * ZERO-ALLOCATION: Uses shared static buffers instead of creating
+     * throwaway ByteArrays. For typical skip(64) this means 0 GC pressure
+     * per connection handshake (was 4 allocations × 64 bytes before).
+     */
     fun skip(n: Int) {
-        cipher.update(ByteArray(n))
+        var remaining = n
+        while (remaining > 0) {
+            val chunk = minOf(remaining, SKIP_BUF.size)
+            cipher.update(SKIP_BUF, 0, chunk, SKIP_OUT, 0)
+            remaining -= chunk
+        }
     }
 }
 

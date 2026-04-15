@@ -33,6 +33,7 @@ class TcpServer(
 
     private val wsBlacklist = ConcurrentHashMap.newKeySet<String>()
     private val dcFailUntil = ConcurrentHashMap<String, Long>()
+    private val replayProtection = ReplayProtection()
 
     @Volatile
     var isRunning = false
@@ -130,7 +131,7 @@ class TcpServer(
                     
                     serverScope.launch(Dispatchers.IO) {
                         try {
-                            handleClient(client, secret, pool)
+                            handleClient(client, secret, pool, this)
                         } catch (e: Exception) {
                             if (e !is kotlinx.coroutines.CancellationException) {
                                 log("DEBUG", "Client error: $e")
@@ -162,6 +163,7 @@ class TcpServer(
         scope?.cancel()
         try { serverSocket?.dispose() } catch (_: Exception) {}
         wsPool?.reset()
+        replayProtection.clear()
         serverSocket = null
         wsPool = null
         scope = null
@@ -172,7 +174,7 @@ class TcpServer(
      * Handle a single client connection.
      * Port of _handle_client from tg_ws_proxy.py.
      */
-    private suspend fun handleClient(client: Socket, secret: ByteArray, pool: WsPool) {
+    private suspend fun handleClient(client: Socket, secret: ByteArray, pool: WsPool, clientScope: CoroutineScope) {
         stats.connectionsTotal.incrementAndGet()
         stats.connectionsActive.incrementAndGet()
 
@@ -226,9 +228,9 @@ class TcpServer(
                 output.writeFully(serverHello)
                 output.flush()
 
-                // Wrap FakeTls channels
-                clientInput = FakeTls.run { unwrapFakeTls(input) }
-                clientOutput = FakeTls.run { wrapFakeTls(output) }
+                // Wrap FakeTls channels (structured concurrency — tied to client lifecycle)
+                clientInput = FakeTls.unwrapFakeTls(input, clientScope)
+                clientOutput = FakeTls.wrapFakeTls(output, clientScope)
 
                 handshake = try {
                     val buf = ByteArray(Constants.HANDSHAKE_LEN)
@@ -269,6 +271,18 @@ class TcpServer(
                 return
             }
 
+            // Replay attack protection: reject handshakes we've already seen.
+            // TSPU can capture a valid handshake and replay it to probe our port.
+            // Without this check, we'd accept it and reveal ourselves as a proxy.
+            if (!replayProtection.checkAndRecord(handshake)) {
+                stats.connectionsBad.incrementAndGet()
+                log("WARN", "[$label] REPLAY DETECTED — rejecting duplicate handshake nonce")
+                try {
+                    clientInput.discard()
+                } catch (_: Exception) {}
+                return
+            }
+
             val (dc, isMedia, protoTag, clientDecPrekeyIv) = result
 
             val protoInt = when {
@@ -282,8 +296,14 @@ class TcpServer(
 
             log("DEBUG", "[$label] handshake ok: DC$dc$mediaTag proto=0x%08X".format(protoInt))
 
-            // Generate relay init
-            val relayInit = MtProtoHandshake.generateRelayInit(protoTag, dcIdx)
+            // Force Padded Intermediate for relay to Telegram.
+            // Padded Intermediate adds random padding to every MTProto frame,
+            // making packet sizes variable and harder for DPI to fingerprint.
+            // The client-side protocol stays unchanged (proxy translates via re-encryption).
+            val relayProtoTag = Constants.PROTO_TAG_SECURE // 0xDDDDDDDD = Padded Intermediate
+
+            // Generate relay init with padded intermediate protocol
+            val relayInit = MtProtoHandshake.generateRelayInit(relayProtoTag, dcIdx)
 
             // Setup 4 cipher contexts
             val ctx = setupCryptoCtx(clientDecPrekeyIv, secret, relayInit)
@@ -381,7 +401,7 @@ class TcpServer(
             dcFailUntil.remove(dcKey)
             stats.connectionsWs.incrementAndGet()
 
-            val splitter = try {
+            val wsSplitter = try {
                 MsgSplitter(relayInit, protoInt).also {
                     log("DEBUG", "[$label] MsgSplitter activated for proto 0x%08X".format(protoInt))
                 }
@@ -393,7 +413,7 @@ class TcpServer(
             // Start the bidirectional bridge
             Bridge.bridgeWsReencrypt(
                 clientInput, clientOutput, ws, label,
-                dc, isMedia, ctx, splitter, stats,
+                dc, isMedia, ctx, wsSplitter, stats,
                 trafficShaping = config.trafficShaping
             )
 

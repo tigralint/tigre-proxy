@@ -40,9 +40,6 @@ class MsgSplitter(relayInit: ByteArray, private val protoInt: Int) {
         if (chunk.isEmpty()) return emptyList()
         if (disabled) return listOf(chunk)
 
-        // Decrypt to peek at plaintext structure
-        val plainChunk = dec.update(chunk)
-
         // Ensure capacity and compact buffers if necessary
         if (writePos + chunk.size > cipherBuf.size) {
             if (readPos > 0) {
@@ -65,9 +62,9 @@ class MsgSplitter(relayInit: ByteArray, private val protoInt: Int) {
             }
         }
 
-        // Write directly into internal buffers
+        // Write directly into internal buffers WITHOUT intermediate allocation
         System.arraycopy(chunk, 0, cipherBuf, writePos, chunk.size)
-        System.arraycopy(plainChunk, 0, plainBuf, writePos, plainChunk.size)
+        dec.update(chunk, 0, chunk.size, plainBuf, writePos)
         writePos += chunk.size
 
         val parts = mutableListOf<ByteArray>()

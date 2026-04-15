@@ -84,7 +84,7 @@ class ProxyWebSocket private constructor(
         private val antiDpiClient: OkHttpClient by lazy {
             val (sslFactory, trustManager) = AntiDpi.createSystemConscryptSslContext()
             OkHttpClient.Builder()
-                .sslSocketFactory(sslFactory, trustManager)
+                .sslSocketFactory(TlsRecordSplittingFactory(sslFactory), trustManager) // TLS Record Splitting for DPI bypass
                 .dns(AntiDpi.DohDns()) // DNS-over-HTTPS for ECH support
                 .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
                 .connectTimeout(10, TimeUnit.SECONDS)
@@ -154,7 +154,9 @@ class ProxyWebSocket private constructor(
                 }
 
                 val request = requestBuilder.build()
-                val recvChannel = Channel<ByteArray>(1024)
+                // 64 element capacity: max 64 * 16KB = 1MB buffer per connection.
+                // 1024 elements was causing massive memory consumption (up to 16MB per disconnected client)
+                val recvChannel = Channel<ByteArray>(64)
                 var connected = false
 
                 val ws = client.newWebSocket(request, object : WebSocketListener() {

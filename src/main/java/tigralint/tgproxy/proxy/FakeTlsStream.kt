@@ -43,11 +43,12 @@ class FakeTlsStream(
         }
         val payload = readTlsPayload()
         if (payload.isEmpty()) return ByteArray(0)
-        if (payload.size > n) {
-            readBuf.append(payload.copyOfRange(n, payload.size))
-            return payload.copyOfRange(0, n)
+        if (payload.size <= n) {
+            return payload // Fits — no copy needed
         }
-        return payload
+        // Payload too large: return first n bytes, buffer the rest
+        readBuf.append(payload, n, payload.size - n)
+        return payload.copyOfRange(0, n)
     }
 
     /**
@@ -142,9 +143,13 @@ class ByteArrayBuffer {
     val size: Int get() = writePos - readPos
 
     fun append(bytes: ByteArray) {
-        ensureCapacity(bytes.size)
-        System.arraycopy(bytes, 0, data, writePos, bytes.size)
-        writePos += bytes.size
+        append(bytes, 0, bytes.size)
+    }
+
+    fun append(bytes: ByteArray, offset: Int, length: Int) {
+        ensureCapacity(length)
+        System.arraycopy(bytes, offset, data, writePos, length)
+        writePos += length
     }
 
     fun consume(n: Int): ByteArray {

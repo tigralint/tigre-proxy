@@ -17,6 +17,7 @@ object ConfigStorage {
     private const val KEY_ANTI_DPI = "anti_dpi"
     private const val KEY_DOH = "doh_enabled"
     private const val KEY_TRAFFIC_SHAPING = "traffic_shaping"
+    private const val KEY_TLS_RECORD_SPLITTING = "tls_record_splitting"
 
     fun save(context: Context, config: ProxyConfig) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -35,6 +36,7 @@ object ConfigStorage {
             putBoolean(KEY_ANTI_DPI, config.antiDpiEnabled)
             putBoolean(KEY_DOH, config.dohEnabled)
             putBoolean(KEY_TRAFFIC_SHAPING, config.trafficShaping)
+            putBoolean(KEY_TLS_RECORD_SPLITTING, config.tlsRecordSplitting)
             
             apply()
         }
@@ -75,6 +77,7 @@ object ConfigStorage {
         config.antiDpiEnabled = prefs.getBoolean(KEY_ANTI_DPI, true)
         config.dohEnabled = prefs.getBoolean(KEY_DOH, true)
         config.trafficShaping = prefs.getBoolean(KEY_TRAFFIC_SHAPING, true)
+        config.tlsRecordSplitting = prefs.getBoolean(KEY_TLS_RECORD_SPLITTING, true)
         
         return config
     }
